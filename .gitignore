@@ -1,0 +1,13 @@
+# Local environment and Python artifacts
+.venv/
+__pycache__/
+*.py[cod]
+
+# Source datasets and generated outputs may contain personnel data
+DATA/
+RESULTADOS_LIMPIEZA/
+RESULTADOS MODELOS/
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
