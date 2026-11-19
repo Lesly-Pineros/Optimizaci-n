@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Asigna personas a plazas de iniciativas con un MILP (SciPy/HiGHS).
 
-Las filas con dos o más skills generan plazas individuales según Internal/
-External. Rol, seniority, tipo y dominio son requisitos; las skills se optimizan
-por cobertura y el nivel esperado depende del seniority.
+Las filas con una o más skills obligatorias generan plazas individuales según
+Internal/External. Rol, seniority, tipo y dominio son requisitos; más skills
+obligatorias cubiertas aumentan la puntuación del candidato.
 """
 import csv
+import json
 import re
 import unicodedata
+from datetime import date, datetime, timedelta
 from collections import defaultdict, Counter
-from difflib import SequenceMatcher
 from pathlib import Path
 from salidas_asignacion import export_tobe
+from mapeo_roles import demand_role_family, person_role_families
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "DATA"
@@ -25,28 +27,28 @@ UNFILLED_FILE = RESULTS / "Plazas sin asignar MILP.csv"
 ROLE_MATCH_FILE = RESULTS / "Similitud de roles.csv"
 EXCEL_FILE = RESULTS / "Asignacion_To-Be_Baseline.xlsx"
 
-MAX_PEOPLE_PER_MESA = 7
-# Capacidad normal por persona. Si impide cubrir la demanda, el MILP permite
-# como máximo una segunda plaza y minimiza el número de personas duplicadas.
-MAX_ASSIGNMENTS_PER_PERSON = 1
-# Equivalencias claras entre abreviaturas de demanda y cargos de SkillsCOE.
-ROLE_ALIASES = {
-    "lt": "tech manager/líder",
-    "dev ext": "desarrollador",
-    "dev int": "desarrollador",
-}
-ROLE_SIMILARITY_THRESHOLD = 0.80
-MIN_SKILLS_PER_ROLE = 2
-# Nivel mínimo para considerar una skill cubierta: 1 básico, 2 intermedio,
-# 3 avanzado. Se aplica a skills técnicas y funcionales obligatorias.
-SENIORITY_SKILL_LEVEL = {
-    "junior": 1,
-    "mid level": 2,
-    "senior": 3,
-    "lead": 3,
-}
-# Regla de negocio confirmada para esta corrida: Operaciones requiere dominio ENG.
+MAX_BASE_ASSIGNMENTS_PER_GROUP = 7
+MAX_SUGGESTED_PER_MESA = 5
+MAX_SIMULTANEOUS_PROJECTS = 2
+MIN_SKILLS_PER_ROLE = 1
+SENIORITY_ORDER = {"junior": 1, "mid level": 2, "senior": 3, "lead": 4}
+
+
+def seniority_fit(project_seniority, person_seniority):
+    """Admite exacto, un nivel superior y finalmente un nivel inferior."""
+    requested = SENIORITY_ORDER.get(norm(project_seniority))
+    actual = SENIORITY_ORDER.get(norm(person_seniority))
+    if requested is None or actual is None or abs(actual - requested) > 1:
+        return None
+    # Un valor mayor expresa preferencia lexicográfica: exacto > superior > inferior.
+    return 2 if actual == requested else (1 if actual > requested else 0)
+# Mapeo de Dirección a Dominio cuando la fuente no proporciona el dominio.
 DIRECTION_MAP = {"Operaciones": "ENG"}
+LEADER_ROLE_MARKERS = ("lider", "lead", "tech manager")
+TESTING_ROLE_MARKERS = ("qa", "test", "testing", "tester", "quality")
+INVALID_ROLE_MARKERS = ("na ", "n a ", "cod eliminado", "codigo eliminado", "retirado")
+HORIZON_START = date(2027, 1, 1)
+HORIZON_END = date(2027, 6, 30)
 
 FILL_DOWN_PROJECT_FIELDS = [
     "Mesa", "Foco estratégico (Fábrica)", "SDATOOL", "Nombre Proyecto",
@@ -86,6 +88,73 @@ def level(value):
     return int(match.group(1)) if match else 0
 
 
+def parse_date(value, *, quarter_end=False):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    quarter = re.search(r"(?i)([1-4])\s*Q\s*(\d{4})|Q\s*([1-4])\s*(\d{4})", value)
+    if quarter:
+        q = int(quarter.group(1) or quarter.group(3))
+        year = int(quarter.group(2) or quarter.group(4))
+        month = q * 3 if quarter_end else (q - 1) * 3 + 1
+        if quarter_end:
+            next_month = month + 1
+            next_year = year
+            if next_month == 13:
+                next_month, next_year = 1, year + 1
+            return date(next_year, next_month, 1) - timedelta(days=1)
+        return date(year, month, 1)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(value[:10], fmt).date()
+        except ValueError:
+            pass
+    try:
+        serial = float(value)
+        if 20000 <= serial <= 80000:
+            return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+    except ValueError:
+        pass
+    return None
+
+
+def dedication_fraction(value):
+    value = str(value or "").strip().replace("%", "").replace(",", ".")
+    try:
+        parsed = float(value)
+    except ValueError:
+        return 0.0
+    return parsed / 100.0 if parsed > 1 else parsed
+
+
+def role_families(value, seniority=None):
+    return person_role_families(value, seniority)
+
+
+def demand_family(value):
+    return demand_role_family(value)
+
+
+def current_staffing_assignment(row):
+    raw = row.get("Asignaciones Staffing Q4", "")
+    try:
+        assignments = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        assignments = []
+    if not isinstance(assignments, list):
+        assignments = []
+    if not assignments:
+        assignments = [{
+            "sda": row.get("SDATOOL - Proyecto", ""),
+            "proyecto": row.get("Proyecto Staffing", ""),
+            "mesa": row.get("Mesa Staffing actual", ""),
+            "fecha_inicio": row.get("Fecha Inicio", ""),
+            "fecha_fin_actual": row.get("Fecha Fin Actual", ""),
+            "dedicacion": row.get("% Dedicación Staffing", ""),
+        }]
+    return max(assignments, key=lambda item: dedication_fraction(item.get("dedicacion")), default={})
+
+
 def load_projects():
     header, rows = read_csv(PROJECT_FILE)
     filled = []
@@ -99,7 +168,16 @@ def load_projects():
             elif previous[field]:
                 row[field] = previous[field]
         filled.append(row)
-    return header, filled
+    retained = []
+    for row in filled:
+        skill_count = len(set(required_skill_names(row, TECH_FIELDS + FUNCTIONAL_FIELDS)))
+        role_defined = demand_family(row.get("Rol")) is not None
+        seniority_defined = norm(row.get("Seniority")) in SENIORITY_ORDER
+        if role_defined and seniority_defined and skill_count >= MIN_SKILLS_PER_ROLE:
+            retained.append(row)
+    print(f"Iniciativas filtradas: {len(retained)} conservadas de {len(filled)} "
+          "(rol mapeado, seniority válido y al menos 1 skill obligatoria).")
+    return header, retained
 
 
 def load_people():
@@ -112,64 +190,59 @@ def load_people():
             continue
         seen.add(person_key)
         direction = (row.get("Dominio") or "").strip()
+        resource_type = norm(row.get("Tipo de Recurso"))
+        if resource_type == "subsidiaria":
+            resource_type = "externo"
+        current = current_staffing_assignment(row)
+        assignments_raw = row.get("Asignaciones Staffing Q4", "")
+        try:
+            assignments = json.loads(assignments_raw) if assignments_raw else []
+        except json.JSONDecodeError:
+            assignments = []
+        end_dates = [parse_date(item.get("fecha_fin_actual"), quarter_end=True)
+                     for item in assignments if isinstance(item, dict)]
+        release_dates = [value for value in end_dates if value]
+        release_date = max(release_dates, default=None)
+        # Un profesional sin asignación Q4 entra en backlog y está disponible
+        # desde el inicio del horizonte; los filtros de rol/dominio siguen aplicando.
         skills = {norm(name): level(value) for name, value in row.items() if name.strip()}
+        seniority_raw = (row.get("Seniority") or row.get("Nivel del Rol Actual") or "").strip()
         result.append({
             "key": person_key,
             "code": (row.get("Código") or "").strip(),
             "name": (row.get("Nombre") or "").strip(),
             "role": norm(row.get("Rol Principal")),
             "role_raw": (row.get("Rol Principal") or "").strip(),
-            "seniority": norm(row.get("Nivel del Rol Actual")),
-            "seniority_raw": (row.get("Nivel del Rol Actual") or "").strip(),
+            "seniority": norm(seniority_raw),
+            "seniority_raw": seniority_raw,
             "company": norm(row.get("Empresa")),
-            "resource_type": {"interno": "interno", "externo": "externo"}.get(norm(row.get("Tipo de Recurso")), ""),
+            "resource_type": {"interno": "interno", "externo": "externo"}.get(resource_type, ""),
             "direction": direction,
+            "domains": {norm(value) for value in direction.split("|") if norm(value)},
+            # El SDA seleccionado proviene de SDATOOL - Proyecto, emparejado con
+            # el registro de mayor dedicación en el detalle de Staffing enriquecido.
+            "staffing_sda": current.get("sda") or row.get("SDATOOL - Proyecto", ""),
+            "families": role_families(row.get("Rol Principal"), seniority_raw),
+            "staffing_status": row.get("Estado Staffing", ""),
+            "staffing_assignments": assignments,
+            "current_assignment": current,
+            "release_date": release_date,
             "skills": skills,
         })
     return result
 
 
-def role_target(value):
-    normalized = norm(value)
-    return norm(ROLE_ALIASES.get(normalized, value))
-
-
 def build_role_map(projects, people):
-    candidate_roles = {}
-    for person in people:
-        if person["role"]:
-            candidate_roles.setdefault(person["role"], person["role_raw"])
     mapping, report = {}, []
     for role in sorted({(p.get("Rol") or "").strip() for p in projects if (p.get("Rol") or "").strip()}):
         source = norm(role)
-        suggested_target = ""
-        if source in ROLE_ALIASES:
-            target = norm(ROLE_ALIASES[source])
-            suggested_target = target
-            score, method = (1.0, "equivalencia de abreviatura") if target in candidate_roles else (0.0, "equivalencia sin rol en SkillsCOE")
-        elif source in candidate_roles:
-            target, score, method = source, 1.0, "coincidencia exacta"
-            suggested_target = target
-        else:
-            ranked = []
-            source_tokens = set(source.split())
-            for candidate in candidate_roles:
-                tokens = set(candidate.split())
-                token_score = len(source_tokens & tokens) / max(1, len(source_tokens | tokens))
-                char_score = SequenceMatcher(None, source, candidate, autojunk=False).ratio()
-                ranked.append((max(char_score, token_score), candidate))
-            score, target = max(ranked, default=(0.0, ""))
-            suggested_target = target if score >= ROLE_SIMILARITY_THRESHOLD else ""
-            method = "sugerencia para revisión" if score >= ROLE_SIMILARITY_THRESHOLD else "sin similitud suficiente"
-            # Las similitudes no exactas se reportan, pero requieren revisión humana.
-            target = ""
-        mapping[source] = target
+        family = demand_family(role)
+        mapping[source] = family
         report.append({
             "Rol iniciativa": role,
-            "Rol SkillsCOE sugerido": candidate_roles.get(suggested_target, ""),
-            "Similitud": round(score, 3),
-            "Método": method,
-            "Usar en asignación": "Sí" if target else "No",
+            "Familia de rol": family,
+            "Método": "mapeo a familia",
+            "Usar en asignación": "Sí" if family else "No",
         })
     return mapping, report
 
@@ -178,76 +251,147 @@ def required_skill_names(row, fields):
     return [norm(row.get(field)) for field in fields if (row.get(field) or "").strip()]
 
 
-def skill_fit(project, person):
-    """Resume la cobertura de skills sin exigir que se cumplan todas."""
+def numeric_tokens(value):
+    """Identificadores numéricos completos de Mesa/SDA (no compara dígitos parciales)."""
+    return set(re.findall(r"\d+", norm(value)))
+
+
+def labels_match_by_text_or_number(left, right):
+    left_norm, right_norm = norm(left), norm(right)
+    if not left_norm or not right_norm:
+        return False
+    left_parts = {norm(part) for part in str(left or "").split("|") if norm(part)}
+    right_parts = {norm(part) for part in str(right or "").split("|") if norm(part)}
+    if left_parts & right_parts:
+        return True
+    return bool(numeric_tokens(left_norm) & numeric_tokens(right_norm))
+
+
+def skill_fit(project, person, role_map=None):
+    """Cuenta skills obligatorias registradas, sin filtrar por nivel."""
     required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
-    seniority = norm(project.get("Seniority"))
-    minimum = SENIORITY_SKILL_LEVEL.get(seniority, 1)
     levels = [person["skills"].get(skill, 0) for skill in required]
-    covered = sum(value >= minimum for value in levels)
+    covered = sum(value > 0 for value in levels)
     known = sum(value > 0 for value in levels)
-    # La cobertura al nivel esperado manda; luego se favorecen skills con
-    # conocimiento parcial y mejores niveles dentro del umbral.
-    score = covered * 10000 + known * 100 + sum(min(value, minimum) for value in levels)
-    suggested = required_skill_names(project, SUGGESTED_FIELDS)
-    score += sum(person["skills"].get(skill, 0) > 0 for skill in suggested) * 10
-    return covered, len(required), known, minimum, score
+    return covered, len(required), known, None, covered
+
+
+def skill_observation(project, person, role_map=None):
+    """Describe el caso LT cuando el match obligatorio se encuentra en Básico."""
+    role = (role_map or {}).get(norm(project.get("Rol")), demand_family(project.get("Rol")))
+    if role != "LT":
+        return ""
+    required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
+    if any(person["skills"].get(skill, 0) == 1 for skill in required):
+        return "LT: cumple al menos una skill obligatoria, pero en nivel Básico (1)."
+    return ""
+
+
+def affinity_components(project, person):
+    """Return the continuity and Domain preference components."""
+    current = person.get("current_assignment", {})
+    staffing_sda = person.get("staffing_sda", current.get("sda", ""))
+    current_project = norm(current.get("proyecto"))
+    current_mesa = norm(current.get("mesa"))
+    initiative_sda = project.get("SDATOOL", "")
+    project_name = norm(project.get("Nombre Proyecto"))
+    project_mesa = norm(project.get("Mesa"))
+    continuity = int(bool(
+        labels_match_by_text_or_number(current_mesa, project_mesa)
+        or labels_match_by_text_or_number(staffing_sda, initiative_sda)
+        or (current_project and project_name and current_project == project_name)
+    ))
+    domain = norm(DIRECTION_MAP.get(project.get("Dominio", ""), project.get("Dominio", "")))
+    domains = person.get("domains") or {
+        norm(value) for value in str(person.get("direction", "")).split("|") if norm(value)
+    }
+    domain_match = int(bool(domain and domain in domains))
+    return continuity, domain_match
+
+
+def affinity_score(project, person, role_map=None):
+    continuity, domain_match = affinity_components(project, person)
+    matched_skills = skill_fit(project, person, role_map)[0]
+    return continuity * 1000 + domain_match * 100 + matched_skills
+
+
+def combined_preference_score(project, person, number_of_slots, role_map=None):
+    """Ordena por continuidad, Dominio y finalmente skills obligatorias cubiertas."""
+    continuity, domain_match = affinity_components(project, person)
+    matched_skills = skill_fit(project, person, role_map)[0]
+    max_skills = len(TECH_FIELDS) + len(FUNCTIONAL_FIELDS)
+    skill_total_ceiling = number_of_slots * max_skills
+    domain_weight = skill_total_ceiling + 1
+    continuity_weight = number_of_slots * (domain_weight + max_skills) + 1
+    return continuity * continuity_weight + domain_match * domain_weight + matched_skills
 
 
 def eligibility(project, person, skill_columns, role_map):
-    role = role_map.get(norm(project.get("Rol")), "")
+    mapped_role = role_map.get(norm(project.get("Rol")))
+    role = mapped_role if mapped_role in {"LT", "DEV", "QA"} else demand_family(project.get("Rol"))
+    person_families = person.get("families") or role_families(person.get("role_raw", person.get("role", "")))
     seniority = norm(project.get("Seniority"))
-    if not role or person["role"] != role:
+    if not role or role not in person_families:
         return False, 0, "rol"
-    if not seniority or person["seniority"] != seniority:
+    if seniority_fit(seniority, person["seniority"]) is None:
         return False, 0, "seniority"
 
     required_type = project.get("_required_type", "")
-    if not required_type or person["resource_type"] != required_type:
+    if required_type not in {"interno", "externo"}:
         return False, 0, "tipo interno/externo"
 
-    project_direction = norm(DIRECTION_MAP.get(
-        (project.get("Dominio") or "").strip(), project.get("Dominio")))
-    person_domains = {norm(v) for v in person["direction"].split("|") if norm(v)}
-    if not project_direction or project_direction not in person_domains:
-        return False, 0, "dominio"
+    person_domains = person.get("domains") or {
+        norm(value) for value in str(person.get("direction", "")).split("|") if norm(value)
+    }
+    if "eng" not in person_domains:
+        return False, 0, "dominio distinto de ENG"
 
-    is_technical_lead = norm(project.get("Rol")) in {"lt", "lider tecnico", "lider técnico"}
-    if is_technical_lead and person["company"] != norm("BBVA"):
-        return False, 0, "LT solo BBVA"
+    if role == "LT" and (required_type != "interno" or person.get("resource_type") != "interno"):
+        return False, 0, "LT solo BBVA y sin sustitución de tipo"
 
-    required_tech = required_skill_names(project, TECH_FIELDS)
-    required_functional = required_skill_names(project, FUNCTIONAL_FIELDS)
-    skill_count = len(required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS + SUGGESTED_FIELDS))
-    if skill_count < MIN_SKILLS_PER_ROLE:
-        return False, 0, "menos de dos skills"
-    covered, _, known, _, fit_score = skill_fit(project, person)
-    if known == 0:
-        return False, 0, "sin skills coincidentes"
-    return True, fit_score, ""
+    required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
+    if len(required) < MIN_SKILLS_PER_ROLE:
+        return False, 0, "sin skills obligatorias en la demanda"
+    covered, _, _, _, _ = skill_fit(project, person, role_map)
+    if covered < MIN_SKILLS_PER_ROLE:
+        return False, 0, "ninguna skill obligatoria registrada"
+
+    start = parse_date(project.get("Fecha Inicio")) or HORIZON_START
+    effective_start = max(start, HORIZON_START)
+    if person.get("release_date") and person["release_date"] >= effective_start:
+        return False, 0, "no liberado para el inicio del horizonte de asignación"
+    return True, affinity_score(project, dict(person, domains=person_domains), role_map), ""
 
 
 def diagnose_no_candidate(project, people, skill_columns, role_map):
     """Devuelve el primer criterio que deja la plaza sin candidatos."""
     pool = people
-    role = role_map.get(norm(project.get("Rol")), "")
-    pool = [p for p in pool if role and p["role"] == role]
+    mapped = role_map.get(norm(project.get("Rol")))
+    role = mapped if mapped in {"LT", "DEV", "QA"} else demand_family(project.get("Rol"))
+    pool = [p for p in pool if role and role in (p.get("families") or role_families(p.get("role_raw", p.get("role", ""))))]
     if not pool:
         return "No hay persona con rol compatible"
     seniority = norm(project.get("Seniority"))
-    pool = [p for p in pool if seniority and p["seniority"] == seniority]
+    pool = [p for p in pool if seniority_fit(seniority, p["seniority"]) is not None]
     if not pool:
         return "No hay persona con seniority compatible"
     required_type = project.get("_required_type", "")
-    pool = [p for p in pool if p["resource_type"] == required_type]
+    if role == "LT":
+        pool = [p for p in pool if p["resource_type"] == "interno"
+                and required_type == "interno"]
+        if not pool:
+            return "No hay LT interno elegible; LT no admite sustitución de tipo"
+    else:
+        pool = [p for p in pool if p["resource_type"] in {"interno", "externo"}]
+        if not pool:
+            return "No hay persona interna ni externa elegible"
+    pool = [p for p in pool if "eng" in (p.get("domains") or {
+        norm(value) for value in str(p.get("direction", "")).split("|") if norm(value)
+    })]
     if not pool:
-        return "No hay persona del tipo interno/externo requerido"
-    domain = norm(DIRECTION_MAP.get(project.get("Dominio", ""), project.get("Dominio", "")))
-    pool = [p for p in pool if domain and domain in {norm(v) for v in p["direction"].split("|") if norm(v)}]
-    if not pool:
-        return "No hay persona con el dominio requerido por la iniciativa"
-    if norm(project.get("Rol")) in {"lt", "lider tecnico"}:
-        pool = [p for p in pool if p["company"] == norm("BBVA")]
+        return "No hay persona con Dominio ENG"
+    if role == "LT":
+        pool = [p for p in pool if p["resource_type"] == "interno"]
         if not pool:
             return "No hay LT elegible que sea del banco"
     skill_failures = Counter()
@@ -258,17 +402,20 @@ def diagnose_no_candidate(project, people, skill_columns, role_map):
     if skill_failures:
         reason = skill_failures.most_common(1)[0][0]
         return {
-            "sin skills coincidentes": "Ninguna persona elegible tiene alguna de las skills obligatorias",
-            "menos de dos skills": "La plaza declara menos de dos skills",
+            "sin skills obligatorias en la demanda": "La vacante no declara skills obligatorias",
+            "ninguna skill obligatoria registrada": "Ninguna persona tiene una skill obligatoria registrada",
         }.get(reason, "No hay persona con skills coincidentes")
     return "No hay persona elegible"
 
 
-def solve(projects, people, skill_columns, role_map):
+def make_slots(projects):
     slots = []
     for index, project in enumerate(projects):
-        skill_count = len(required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS + SUGGESTED_FIELDS))
-        if not (project.get("Rol") or "").strip() or not (project.get("Seniority") or "").strip() or skill_count < MIN_SKILLS_PER_ROLE:
+        if not (project.get("Rol") or "").strip() or not (project.get("Seniority") or "").strip():
+            continue
+        start = parse_date(project.get("Fecha Inicio"))
+        end = parse_date(project.get("Fecha Fin"), quarter_end=True)
+        if start and start > HORIZON_END or end and end < HORIZON_START:
             continue
         categories = []
         for field, category in (("Internal", "interno"), ("External", "externo")):
@@ -288,18 +435,63 @@ def solve(projects, people, skill_columns, role_map):
             except ValueError:
                 source_row = index + 2
             slots.append((source_row, demand))
+    return slots
+
+
+def project_key(project):
+    return (key(project.get("SDATOOL")), norm(project.get("Nombre Proyecto")),
+            norm(project.get("Mesa")), project.get("Fecha Inicio", ""), project.get("Fecha Fin", ""))
+
+
+def mesa_group_key(project):
+    """Clave interna de conteo; no se agrega como columna de salida."""
+    return (norm(project.get("Mesa")), norm(project.get("Foco estratégico (Fábrica)")))
+
+
+def intervals_overlap(project_a, project_b):
+    start_a = parse_date(project_a.get("Fecha Inicio")) or HORIZON_START
+    end_a = parse_date(project_a.get("Fecha Fin"), quarter_end=True) or HORIZON_END
+    start_b = parse_date(project_b.get("Fecha Inicio")) or HORIZON_START
+    end_b = parse_date(project_b.get("Fecha Fin"), quarter_end=True) or HORIZON_END
+    start_a, start_b = max(start_a, HORIZON_START), max(start_b, HORIZON_START)
+    end_a, end_b = min(end_a, HORIZON_END), min(end_b, HORIZON_END)
+    return max(start_a, start_b) <= min(end_a, end_b)
+
+
+def solve_slots(slots, people, role_map, viability_matrix=None, affinity_matrix=None,
+                recommendation_pool=None, fixed_assignments=None):
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix, csr_matrix, vstack
+
+    if viability_matrix is not None and viability_matrix.shape != (len(slots), len(people)):
+        raise ValueError("La matriz V no coincide con las dimensiones de plazas y personas")
+    if affinity_matrix is not None and affinity_matrix.shape != (len(slots), len(people)):
+        raise ValueError("La matriz A no coincide con las dimensiones de plazas y personas")
 
     pairs = []
+    restrict_to_fixed_and_suggested = fixed_assignments is not None
+    fixed_assignments = set(fixed_assignments or [])
     reasons = defaultdict(int)
     eligible_by_slot = defaultdict(list)
     for slot_index, (source_row, project) in enumerate(slots):
+        project_key_value = project_key(project)
+        mesa_key = mesa_group_key(project)
+        if not any(mesa_key):
+            reasons[(slot_index, "mesa")]
+            continue
         for person_index, person in enumerate(people):
-            ok, score, reason = eligibility(project, person, skill_columns, role_map)
+            if viability_matrix is not None and not viability_matrix[slot_index, person_index]:
+                continue
+            group_key = mesa_group_key(project)
+            if restrict_to_fixed_and_suggested and ((slot_index, person_index) not in fixed_assignments
+                                                    and person_index not in (recommendation_pool or {}).get(group_key, [])):
+                continue
+            ok, score, reason = eligibility(project, person, set(), role_map)
+            if viability_matrix is not None and not ok:
+                raise ValueError(f"La matriz V marca viable un par que no pasa los filtros: slot {slot_index}, persona {person_index}")
             if ok:
-                project_key = (key(project.get("SDATOOL")), norm(project.get("Nombre Proyecto")))
-                mesa_key = norm(project.get("Mesa"))
-                domain_key = norm(DIRECTION_MAP.get(project.get("Dominio", ""), project.get("Dominio", "")))
-                pairs.append((slot_index, person_index, score, project_key, mesa_key, domain_key))
+                pairs.append((slot_index, person_index, score, project_key_value, mesa_key))
                 eligible_by_slot[slot_index].append(person_index)
             else:
                 reasons[(slot_index, reason)] += 1
@@ -307,63 +499,269 @@ def solve(projects, people, skill_columns, role_map):
     if not pairs:
         return slots, [], reasons, eligible_by_slot
 
-    try:
-        import numpy as np
-        from scipy.optimize import Bounds, LinearConstraint, milp
-        from scipy.sparse import coo_matrix
-    except ImportError as exc:
-        raise RuntimeError("Falta SciPy. Instala las dependencias con: python3 -m pip install -r requirements-milp.txt") from exc
-
-    # x: asignaciones; y: persona presente en una mesa; r: desborde de una plaza.
-    # El desborde solo se habilita si es necesario para cubrir toda la demanda.
     n_x = len(pairs)
-    y_keys = sorted({(person, mesa) for _, person, _, _, mesa, _ in pairs if mesa})
-    y_index = {value: n_x + i for i, value in enumerate(y_keys)}
-    repeat_start = n_x + len(y_keys)
-    repeat_keys = sorted({person for _, person, *_ in pairs})
-    repeat_index = {person: repeat_start + i for i, person in enumerate(repeat_keys)}
-    n_vars = repeat_start + len(repeat_keys)
+    mesa_person_keys = sorted({(person, mesa) for _, person, _, _, mesa in pairs})
+    mesa_person_index = {item: n_x + i for i, item in enumerate(mesa_person_keys)}
+    project_person_keys = sorted({(person, project_id) for _, person, _, project_id, _ in pairs})
+    project_person_start = n_x + len(mesa_person_keys)
+    project_person_index = {item: project_person_start + i
+                            for i, item in enumerate(project_person_keys)}
+    mesa_active_start = project_person_start + len(project_person_keys)
+    mesa_active_keys = sorted({mesa_group_key(project) for _, project in slots
+                               if any(mesa_group_key(project))})
+    mesa_active_index = {mesa: mesa_active_start + i for i, mesa in enumerate(mesa_active_keys)}
+    mesa_type_active_start = mesa_active_start + len(mesa_active_keys)
+    mesa_type_keys = sorted({(mesa, people[person]["resource_type"])
+                             for _, person, _, _, mesa in pairs})
+    mesa_type_active_index = {item: mesa_type_active_start + i
+                              for i, item in enumerate(mesa_type_keys)}
+    mesa_mixed_start = mesa_type_active_start + len(mesa_type_keys)
+    mesa_mixed_keys = sorted({mesa for mesa in mesa_active_keys
+                              if (mesa, "interno") in mesa_type_active_index
+                              and (mesa, "externo") in mesa_type_active_index})
+    mesa_mixed_index = {mesa: mesa_mixed_start + i
+                        for i, mesa in enumerate(mesa_mixed_keys)}
+    n_vars = mesa_mixed_start + len(mesa_mixed_keys)
+    by_slot, by_person_project, by_mesa_person = defaultdict(list), defaultdict(list), defaultdict(list)
+    by_mesa_type = defaultdict(lambda: defaultdict(list))
+    rows, lower, upper = [], [], []
+    def add_constraint(coefficients, lo=-np.inf, hi=np.inf):
+        rows.append(coefficients); lower.append(float(lo)); upper.append(float(hi))
 
-    by_slot, by_person, by_person_project = defaultdict(list), defaultdict(list), defaultdict(list)
-    by_mesa = defaultdict(list)
-    rows, upper = [], []
-    def add_constraint(coefficients, ub):
-        rows.append(coefficients); upper.append(float(ub))
-
-    for j, (slot, person, score, project_key, mesa, domain) in enumerate(pairs):
+    for j, (slot, person, score, project_id, mesa) in enumerate(pairs):
         by_slot[slot].append(j)
-        by_person[person].append(j)
-        by_person_project[(person, project_key)].append(j)
-        if mesa:
-            by_mesa[mesa].append(y_index[(person, mesa)])
-            add_constraint({j: 1.0, y_index[(person, mesa)]: -1.0}, 0)
+        by_person_project[(person, project_id)].append(j)
+        by_mesa_person[mesa].append(mesa_person_index[(person, mesa)])
+        z = project_person_index[(person, project_id)]
+        y = mesa_person_index[(person, mesa)]
+        add_constraint({j: 1, z: -1}, hi=0)
+        add_constraint({j: 1, y: -1}, hi=0)
+        add_constraint({j: 1, mesa_active_index[mesa]: -1}, hi=0)
+        resource_type = people[person]["resource_type"]
+        add_constraint({j: 1, mesa_type_active_index[(mesa, resource_type)]: -1}, hi=0)
+        by_mesa_type[mesa][resource_type].append(j)
 
     for variables in by_slot.values():
-        add_constraint({v: 1.0 for v in variables}, 1)
-    for person, variables in by_person.items():
-        coefficients = {v: 1.0 for v in variables}
-        coefficients[repeat_index[person]] = -1.0
-        add_constraint(coefficients, MAX_ASSIGNMENTS_PER_PERSON)
+        add_constraint({v: 1 for v in variables}, hi=1)
+    pair_index = {(slot, person): j for j, (slot, person, *_rest) in enumerate(pairs)}
+    for fixed_pair in fixed_assignments:
+        if fixed_pair not in pair_index:
+            raise ValueError(f"Asignación base fija no es viable en la expansión: {fixed_pair}")
+        add_constraint({pair_index[fixed_pair]: 1}, lo=1, hi=1)
     for variables in by_person_project.values():
-        add_constraint({v: 1.0 for v in variables}, 1)
-    for variables in by_mesa.values():
-        add_constraint({v: 1.0 for v in set(variables)}, MAX_PEOPLE_PER_MESA)
+        add_constraint({v: 1 for v in variables}, hi=1)
+    recommendation_pool = recommendation_pool or {}
+    for mesa in by_mesa_person:
+        suggested_people = set(recommendation_pool.get(mesa, []))
+        fixed_variables = [mesa_person_index[(person, group)]
+                           for person, group in mesa_person_keys
+                           if group == mesa and person not in suggested_people]
+        suggested_variables = [mesa_person_index[(person, group)]
+                               for person, group in mesa_person_keys
+                               if group == mesa and person in suggested_people]
+        add_constraint({v: 1 for v in set(fixed_variables)}, hi=MAX_BASE_ASSIGNMENTS_PER_GROUP)
+        add_constraint({v: 1 for v in set(suggested_variables)}, hi=MAX_SUGGESTED_PER_MESA)
+
+    # Una persona puede cubrir plazas en hasta dos proyectos simultáneos.
+    # No se bloquea el segundo proyecto por el solo hecho de solaparse.
+    for person in range(len(people)):
+        project_keys = [project_id for p, project_id in project_person_keys if p == person]
+        boundaries = set()
+        for project_id in project_keys:
+            project = next(slots[slot][1] for slot, p, _, pid, _ in pairs
+                           if p == person and pid == project_id)
+            start = max(parse_date(project.get("Fecha Inicio")) or HORIZON_START, HORIZON_START)
+            end = min(parse_date(project.get("Fecha Fin"), quarter_end=True) or HORIZON_END, HORIZON_END)
+            boundaries.add(start)
+            if end < HORIZON_END:
+                boundaries.add(end + timedelta(days=1))
+        for point in boundaries:
+            active = []
+            for project_id in project_keys:
+                project = next(slots[slot][1] for slot, p, _, pid, _ in pairs
+                               if p == person and pid == project_id)
+                start = max(parse_date(project.get("Fecha Inicio")) or HORIZON_START, HORIZON_START)
+                end = min(parse_date(project.get("Fecha Fin"), quarter_end=True) or HORIZON_END, HORIZON_END)
+                if start <= point <= end:
+                    active.append(project_person_index[(person, project_id)])
+            if active:
+                add_constraint({z: 1 for z in active}, hi=MAX_SIMULTANEOUS_PROJECTS)
+
+    # Vincula la composición real de recursos a las asignaciones. La mezcla
+    # interna/externa se optimiza como preferencia tras maximizar cobertura, así
+    # una falta de un tipo no bloquea plazas que sí puede cubrir el tipo opuesto.
+    for mesa, resource_type in mesa_type_keys:
+        type_active = mesa_type_active_index[(mesa, resource_type)]
+        variables = by_mesa_type[mesa][resource_type]
+        add_constraint({type_active: 1, **{v: -1 for v in variables}}, hi=0)
+    for mesa in mesa_mixed_keys:
+        internal = mesa_type_active_index[(mesa, "interno")]
+        external = mesa_type_active_index[(mesa, "externo")]
+        mixed = mesa_mixed_index[mesa]
+        add_constraint({mixed: 1, internal: -1}, hi=0)
+        add_constraint({mixed: 1, external: -1}, hi=0)
+        add_constraint({mixed: 1, internal: -1, external: -1}, lo=-1)
+
     rr, cc, vv = [], [], []
     for row_index, coefficients in enumerate(rows):
         for variable, coefficient in coefficients.items():
             rr.append(row_index); cc.append(variable); vv.append(coefficient)
     matrix = coo_matrix((vv, (rr, cc)), shape=(len(rows), n_vars)).tocsr()
-    # Prioriza cubrir plazas; el ajuste por skills desempata.
-    objective = np.zeros(n_vars)
-    objective[:n_x] = [-1_000_000_000.0 - score for _, _, score, _, _, _ in pairs]
-    objective[repeat_start:] = 1_000_000.0
-    result = milp(objective, integrality=np.ones(n_vars), bounds=Bounds(0, 1),
-                  constraints=LinearConstraint(matrix, np.full(len(rows), -np.inf), np.array(upper)),
-                  options={"time_limit": 300})
-    if result.x is None:
-        raise RuntimeError(f"El solver no encontró solución: {result.message}")
-    selected = [(pairs[j][0], pairs[j][1], pairs[j][2]) for j, value in enumerate(result.x[:n_x]) if value > 0.5]
+    integrality = np.ones(n_vars)
+    bounds = Bounds(np.zeros(n_vars), np.ones(n_vars))
+    mesa_demand = Counter(mesa_group_key(project) for _, project in slots if any(mesa_group_key(project)))
+    coverage_weights = np.array([1 / max(1, mesa_demand[pair[4]]) for pair in pairs], dtype=float)
+
+    def run(objective, extra_constraints=()):
+        matrices = [matrix]
+        lows, highs = [np.array(lower)], [np.array(upper)]
+        if extra_constraints:
+            extra_rows, extra_cols, extra_values = [], [], []
+            extra_lows, extra_highs = [], []
+            for row_id, (coeff, lo, hi) in enumerate(extra_constraints):
+                for col, value in coeff.items():
+                    extra_rows.append(row_id); extra_cols.append(col); extra_values.append(value)
+                extra_lows.append(lo); extra_highs.append(hi)
+            matrices.append(csr_matrix((extra_values, (extra_rows, extra_cols)),
+                                       shape=(len(extra_constraints), n_vars)))
+            lows.append(np.array(extra_lows)); highs.append(np.array(extra_highs))
+            active_matrix = vstack(matrices)
+        else:
+            active_matrix = matrix
+        result = milp(objective, integrality=integrality, bounds=bounds,
+                      constraints=LinearConstraint(active_matrix, np.concatenate(lows), np.concatenate(highs)),
+                      options={"time_limit": 300})
+        if result.x is None or result.status != 0:
+            raise RuntimeError(f"Fase MILP sin óptimo certificado (status {result.status}): {result.message}")
+        return result
+
+    weighted_objective = np.zeros(n_vars)
+    weighted_objective[:n_x] = -coverage_weights
+    phase1 = run(weighted_objective)
+    best_weighted = round(float(np.dot(coverage_weights, phase1.x[:n_x])), 8)
+    weighted_constraint = ({j: float(coverage_weights[j]) for j in range(n_x)}, best_weighted, best_weighted)
+
+    total_objective = np.zeros(n_vars); total_objective[:n_x] = -1
+    phase2 = run(total_objective, [weighted_constraint])
+    best_total = int(round(float(np.sum(phase2.x[:n_x]))))
+    total_constraint = ({j: 1.0 for j in range(n_x)}, best_total, best_total)
+    mix_constraints = []
+    if mesa_mixed_keys:
+        mix_objective = np.zeros(n_vars)
+        mix_objective[[mesa_mixed_index[mesa] for mesa in mesa_mixed_keys]] = -1
+        phase_mix = run(mix_objective, [weighted_constraint, total_constraint])
+        best_mixed_groups = int(round(sum(phase_mix.x[mesa_mixed_index[mesa]]
+                                           for mesa in mesa_mixed_keys)))
+        mix_constraints = [({mesa_mixed_index[mesa]: 1.0 for mesa in mesa_mixed_keys},
+                            best_mixed_groups, best_mixed_groups)]
+    requested_type_scores = np.array([
+        int(people[pair[1]]["resource_type"] == slots[pair[0]][1].get("_required_type"))
+        for pair in pairs
+    ], dtype=float)
+    requested_type_objective = np.zeros(n_vars)
+    requested_type_objective[:n_x] = -requested_type_scores
+    phase_type = run(requested_type_objective,
+                     [weighted_constraint, total_constraint, *mix_constraints])
+    best_requested_type = int(round(float(np.dot(requested_type_scores, phase_type.x[:n_x]))))
+    requested_type_constraint = ({j: float(requested_type_scores[j]) for j in range(n_x)},
+                                 best_requested_type, best_requested_type)
+    seniority_tiers = [seniority_fit(slots[pair[0]][1].get("Seniority"),
+                                     people[pair[1]]["seniority"]) for pair in pairs]
+    exact_scores = np.array([int(tier == 2) for tier in seniority_tiers], dtype=float)
+    above_scores = np.array([int(tier == 1) for tier in seniority_tiers], dtype=float)
+    exact_objective = np.zeros(n_vars); exact_objective[:n_x] = -exact_scores
+    phase4 = run(exact_objective, [weighted_constraint, total_constraint,
+                                  *mix_constraints, requested_type_constraint])
+    best_exact = int(round(float(np.dot(exact_scores, phase4.x[:n_x]))))
+    exact_constraint = ({j: float(exact_scores[j]) for j in range(n_x)}, best_exact, best_exact)
+    above_objective = np.zeros(n_vars); above_objective[:n_x] = -above_scores
+    phase5 = run(above_objective, [weighted_constraint, total_constraint,
+                                   *mix_constraints, requested_type_constraint, exact_constraint])
+    best_above = int(round(float(np.dot(above_scores, phase5.x[:n_x]))))
+    above_constraint = ({j: float(above_scores[j]) for j in range(n_x)}, best_above, best_above)
+    if affinity_matrix is not None:
+        final_affinity_scores = np.array([
+            affinity_matrix[pair[0], pair[1]] for pair in pairs
+        ], dtype=float)
+    else:
+        final_affinity_scores = np.array([
+            combined_preference_score(slots[pair[0]][1], people[pair[1]], len(slots), role_map)
+            for pair in pairs
+        ], dtype=float)
+    affinity_objective = np.zeros(n_vars)
+    affinity_objective[:n_x] = -final_affinity_scores
+    final = run(affinity_objective, [weighted_constraint, total_constraint,
+                                     *mix_constraints, requested_type_constraint,
+                                     exact_constraint, above_constraint])
+
+    selected = [(pairs[j][0], pairs[j][1], pairs[j][2])
+                for j, value in enumerate(final.x[:n_x]) if value > 0.5]
     return slots, selected, reasons, eligible_by_slot
+
+
+def solve(projects, people, skill_columns, role_map):
+    slots = make_slots(projects)
+    return solve_slots(slots, people, role_map)
+
+
+def recommend_candidates(slots, selected, people, role_map, limit=5, only_unfilled=False):
+    assigned_by_mesa = defaultdict(set)
+    assigned_slots = set()
+    for slot_index, person_index, _score in selected:
+        mesa = mesa_group_key(slots[slot_index][1])
+        assigned_by_mesa[mesa].add(person_index)
+        assigned_slots.add(slot_index)
+    candidates_by_mesa = defaultdict(dict)
+    for slot_index, (_, project) in enumerate(slots):
+        if only_unfilled and slot_index in assigned_slots:
+            continue
+        mesa = mesa_group_key(project)
+        family = role_map.get(norm(project.get("Rol")), demand_family(project.get("Rol")))
+        if family not in {"DEV", "QA"}:
+            continue
+        for index, person in enumerate(people):
+            ok, _, _ = eligibility(project, person, set(), role_map)
+            # Una sugerencia es opcional: puede estar comprometida en otra
+            # iniciativa. La capacidad solo se exige si se promueve a asignación.
+            if ok and index not in assigned_by_mesa[mesa]:
+                candidates_by_mesa[mesa][index] = max(
+                    candidates_by_mesa[mesa].get(index, 0), affinity_score(project, person, role_map))
+    result = {}
+    for mesa, ranked in candidates_by_mesa.items():
+        result[mesa] = [person for person, _ in sorted(
+            ranked.items(), key=lambda item: (-item[1], people[item[0]]["name"], people[item[0]]["code"]))[:limit]]
+    return result
+
+
+def solve_with_suggestions(slots, people, role_map, viability_matrix=None,
+                           affinity_matrix=None):
+    """Resuelve primero la base de 7, luego permite asignar hasta 5 candidatos sugeridos."""
+    base_result = solve_slots(slots, people, role_map,
+                              viability_matrix=viability_matrix,
+                              affinity_matrix=affinity_matrix)
+    initial_suggestions = recommend_candidates(slots, base_result[1], people, role_map,
+                                               limit=MAX_SUGGESTED_PER_MESA,
+                                               only_unfilled=True)
+    if not any(initial_suggestions.values()):
+        return (*base_result, initial_suggestions)
+    expanded_result = solve_slots(
+        slots, people, role_map, viability_matrix=viability_matrix,
+        affinity_matrix=affinity_matrix, recommendation_pool=initial_suggestions,
+        fixed_assignments={(slot, person) for slot, person, _score in base_result[1]})
+    return (*expanded_result, initial_suggestions)
+
+
+def current_staffing_fields(person):
+    assignment = person.get("current_assignment", {})
+    return {
+        "SDATOOL - Proyecto Staffing actual": assignment.get("sda", ""),
+        "Fecha Inicio Staffing actual": assignment.get("fecha_inicio", ""),
+        "Fecha Fin Actual Staffing": assignment.get("fecha_fin_actual", ""),
+        "Mesa Staffing actual": assignment.get("mesa", ""),
+        "% Dedicación Staffing actual": assignment.get("dedicacion", ""),
+        "Asignaciones Staffing Q4 (detalle)": json.dumps(
+            person.get("staffing_assignments", []), ensure_ascii=False),
+    }
 
 
 def main():
@@ -372,38 +770,58 @@ def main():
     people = load_people()
     role_map, role_report = build_role_map(projects, people)
     skill_columns = {norm(name) for name in read_csv(PEOPLE_FILE)[0]}
-    slots, selected, reasons, eligible_by_slot = solve(projects, people, skill_columns, role_map)
+    slots = make_slots(projects)
+    slots, selected, reasons, eligible_by_slot, recommendation_pool = solve_with_suggestions(
+        slots, people, role_map)
 
     assignments = []
-    assignment_counts = Counter(person for _, person, _ in selected)
     assigned_slots = set()
-    projects_by_person = defaultdict(set)
     people_by_mesa = defaultdict(set)
-    project_key_by_slot = {}
-    for slot_index, (_, demand) in enumerate(slots):
-        project_key_by_slot[slot_index] = (key(demand.get("SDATOOL")), norm(demand.get("Nombre Proyecto")))
     for slot, person_index, score in selected:
         source_row, project = slots[slot]
         person = people[person_index]
+        group = mesa_group_key(project)
+        assignment_source = ("Candidato sugerido adicional"
+                             if person_index in recommendation_pool.get(group, [])
+                             else "Asignación base")
         assigned_slots.add(slot)
-        projects_by_person[person_index].add(project_key_by_slot[slot])
-        people_by_mesa[norm(project.get("Mesa"))].add(person_index)
+        people_by_mesa[mesa_group_key(project)].add(person_index)
+        continuity, domain = affinity_components(project, person)
         assignments.append({
             "Mesa": project.get("Mesa", ""), "SDATOOL": project.get("SDATOOL", ""),
             "Proyecto": project.get("Nombre Proyecto", ""), "Dominio asignado": project.get("Dominio", ""),
             "Rol requerido": project.get("Rol", ""), "Seniority requerido": project.get("Seniority", ""),
-            "Rol SkillsCOE equivalente": next((r["Rol SkillsCOE sugerido"] for r in role_report if norm(r["Rol iniciativa"]) == norm(project.get("Rol"))), ""),
+            "Familia de rol": role_map.get(norm(project.get("Rol")), demand_family(project.get("Rol"))),
             "Tipo requerido": project.get("_required_type", ""), "Tipo persona": person["resource_type"],
+            "Origen de asignación": assignment_source,
+            "Dominio persona": " | ".join(sorted(person.get("domains", set()))),
             "Código": person["code"], "Nombre": person["name"], "Rol persona": person["role_raw"],
-            "Seniority persona": person["seniority_raw"], "Puntaje ajuste": score,
-            "Excepción capacidad": (f"Asignado a {assignment_counts[person_index]} plazas; capacidad base 1"
-                                     if assignment_counts[person_index] > MAX_ASSIGNMENTS_PER_PERSON else ""),
-            "Skills cubiertas al nivel esperado": f"{skill_fit(project, person)[0]}/{skill_fit(project, person)[1]}",
-            "Nivel mínimo de skill": skill_fit(project, person)[3],
+            "Seniority persona": person["seniority_raw"], "Estado Staffing": person.get("staffing_status", ""),
+            "Ajuste seniority": {2: "Exacto", 1: "Un nivel por encima", 0: "Un nivel por debajo"}[
+                seniority_fit(project.get("Seniority"), person["seniority"])],
+            "Ajuste tipo de recurso": (
+                "Exacto" if person["resource_type"] == project.get("_required_type")
+                else f"Sustitución: {person['resource_type']} cubre plaza {project.get('_required_type')}"),
+            "FTE asignado": 1.0, "Afinidad SDA/Mesa actual": continuity,
+            "Afinidad Dominio": domain, "Puntaje preferencias": score,
+            "Puntaje skills obligatorias": skill_fit(project, person, role_map)[0],
+            "Comentario skills obligatorias": skill_observation(project, person, role_map),
+            **current_staffing_fields(person),
+            "Skills obligatorias registradas": (
+                f"{skill_fit(project, person, role_map)[0]}/{skill_fit(project, person, role_map)[1]}"),
+            "Regla de nivel de skill": "No se filtra por nivel",
             "Fila origen": source_row,
         })
 
     unmet = []
+    assigned_types_by_mesa = defaultdict(set)
+    eligible_types_by_mesa = defaultdict(set)
+    for slot, candidates in eligible_by_slot.items():
+        group = mesa_group_key(slots[slot][1])
+        eligible_types_by_mesa[group].update(people[index]["resource_type"] for index in candidates)
+    for slot, person_index, _ in selected:
+        assigned_types_by_mesa[mesa_group_key(slots[slot][1])].add(
+            people[person_index]["resource_type"])
     for slot, (source_row, project) in enumerate(slots):
         if slot in assigned_slots:
             continue
@@ -411,18 +829,19 @@ def main():
         candidates = eligible_by_slot.get(slot, [])
         if not (project.get("Rol") or "").strip() or not (project.get("Seniority") or "").strip():
             reason = "Falta rol o seniority en la demanda"
-        elif not (project.get("Dominio") or "").strip():
-            reason = "Falta Dominio en iniciativa"
         elif not candidates:
             reason = diagnose_no_candidate(project, people, skill_columns, role_map)
-        elif len(people_by_mesa[norm(mesa)]) >= MAX_PEOPLE_PER_MESA:
-            reason = "La mesa ya tiene 7 personas únicas"
-        elif all(len(projects_by_person[p]) >= MAX_ASSIGNMENTS_PER_PERSON for p in candidates):
-            reason = "Las personas elegibles alcanzaron la capacidad máxima del modelo"
-        elif all(project_key_by_slot[slot] in projects_by_person[p] for p in candidates):
-            reason = "Las personas elegibles ya están asignadas a este proyecto"
+        elif (eligible_types_by_mesa[mesa_group_key(project)] == {"interno", "externo"}
+              and assigned_types_by_mesa[mesa_group_key(project)] != {"interno", "externo"}):
+            reason = "Mesa sin asignar: no fue posible asegurar presencia interna y externa"
+        elif len(people_by_mesa[mesa_group_key(project)]) >= MAX_BASE_ASSIGNMENTS_PER_GROUP + MAX_SUGGESTED_PER_MESA:
+            reason = "El grupo alcanzó 7 asignaciones base más 5 sugeridas"
+        elif (len(people_by_mesa[mesa_group_key(project)]) >= MAX_BASE_ASSIGNMENTS_PER_GROUP
+              and not (set(recommendation_pool.get(mesa_group_key(project), []))
+                       - people_by_mesa[mesa_group_key(project)])):
+            reason = "El grupo ya usó sus candidatos sugeridos disponibles"
         else:
-            reason = "Conflicto de capacidad entre plazas elegibles"
+            reason = "Capacidad disponible o solapamiento de proyectos"
         unmet.append({
             "Mesa": mesa, "SDATOOL": project.get("SDATOOL", ""),
             "Proyecto": project.get("Nombre Proyecto", ""), "Dominio": project.get("Dominio", ""),
@@ -442,10 +861,14 @@ def main():
     write(UNFILLED_FILE, unmet)
     write(ROLE_MATCH_FILE, role_report)
     export_tobe(EXCEL_FILE, initiative_header, projects, slots, selected, people,
-                skill_fit, TECH_FIELDS + FUNCTIONAL_FIELDS + SUGGESTED_FIELDS)
-    overflow_people = sum(count > MAX_ASSIGNMENTS_PER_PERSON for count in assignment_counts.values())
-    print(f"Plazas modeladas: {len(slots)} | asignadas: {len(assignments)} | pendientes: {len(unmet)} | "
-          f"personas con sobrecapacidad mínima: {overflow_people}")
+                skill_fit, TECH_FIELDS + FUNCTIONAL_FIELDS + SUGGESTED_FIELDS,
+                role_map=role_map, recommendation_pool=recommendation_pool)
+    print(f"Plazas modeladas: {len(slots)} | asignadas: {len(assignments)} | pendientes: {len(unmet)}")
+    suggested_assigned = sum(
+        person_index in recommendation_pool.get(mesa_group_key(slots[slot][1]), [])
+        for slot, person_index, _score in selected
+    )
+    print(f"Asignaciones promovidas desde sugerencias: {suggested_assigned}")
     print(f"Dominios de iniciativa: {sorted({(p.get('Dominio') or '').strip() for p in projects if (p.get('Dominio') or '').strip()})}")
     print(f"Archivos: {ASSIGNMENTS_FILE} ; {UNFILLED_FILE} ; {ROLE_MATCH_FILE} ; {EXCEL_FILE}")
 

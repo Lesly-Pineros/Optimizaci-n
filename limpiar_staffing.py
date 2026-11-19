@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Extrae y consolida las tres hojas Staffing Q4 de DATA/STAFFING.xlsx."""
+"""Extrae los registros Q4 de Staffing conservando sus asignaciones SDA."""
 
 import csv
+import json
 import re
 import unicodedata
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree as ET
 
@@ -19,7 +21,11 @@ NS = {
     "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "pkg": "http://schemas.openxmlformats.org/package/2006/relationships",
 }
-HEADERS = ["codigo", "interno", "% dedicacion", "rol", "dominio", "direccion"]
+HEADERS = [
+    "codigo", "interno", "% dedicacion", "rol", "dominio", "direccion",
+    "SDATOOL - Proyecto", "Fecha Inicio", "Fecha Fin Actual", "Proyecto",
+    "Mesa actual", "Asignación Staffing", "fuente staffing",
+]
 
 
 def normalize(value):
@@ -35,6 +41,28 @@ def column_index(header, *names):
         if len(matches) == 1:
             return matches[0]
     raise ValueError(f"No se encontró una columna única entre: {', '.join(names)}")
+
+
+def optional_column(header, *names):
+    normalized = [normalize(cell) for cell in header]
+    for name in names:
+        matches = [i for i, cell in enumerate(normalized) if cell == normalize(name)]
+        if matches:
+            return matches[0]
+    return None
+
+
+def staffing_date(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        serial = float(value)
+    except ValueError:
+        return value
+    if not (20000 <= serial <= 80000):
+        return value
+    return (datetime(1899, 12, 30) + timedelta(days=serial)).date().isoformat()
 
 
 def cell_value(cell, shared_strings):
@@ -99,13 +127,31 @@ def extract_q4():
             name = normalize(sheet_name)
             if "system" in name:
                 direction = "system"
-                source_columns = ("codigo", "interno", "% dedicacion", "rol", "dominio")
+                aliases = {
+                    "codigo": ("codigo", "código"),
+                    "interno": ("interno", "interno/ externo"),
+                    "% dedicacion": ("% dedicacion", "dedicacion q", "fte proy", "% total x usuario"),
+                    "rol": ("rol",), "dominio": ("dominio",),
+                    "direccion": ("dirección",),
+                }
             elif "data" in name:
                 direction = "data"
-                source_columns = ("codigo", "interno/ externo", "% total x usuario", "rol", "dominio")
+                aliases = {
+                    "codigo": ("codigo", "código"),
+                    "interno": ("interno/ externo", "interno"),
+                    "% dedicacion": ("fte proy", "dedicacion q", "% total x usuario", "% dedicacion"),
+                    "rol": ("rol",), "dominio": ("dominio",),
+                    "direccion": ("dirección",),
+                }
             elif "arquitectura" in name:
                 direction = "arquitectura"
-                source_columns = ("codigo", "interno", "% dedicacion", "rol", "dominio")
+                aliases = {
+                    "codigo": ("codigo", "código"),
+                    "interno": ("interno", "interno/ externo"),
+                    "% dedicacion": ("% dedicacion", "dedicacion q", "fte proy", "% total x usuario"),
+                    "rol": ("rol",), "dominio": ("dominio",),
+                    "direccion": ("dirección",),
+                }
             else:
                 continue
 
@@ -114,13 +160,39 @@ def extract_q4():
                 header = next(rows)
             except StopIteration:
                 raise ValueError(f"La hoja '{sheet_name}' está vacía")
-            indices = [column_index(header, column) for column in source_columns]
+            indices = {field: column_index(header, *names)
+                       for field, names in aliases.items() if field != "direccion"}
+            indices["direccion"] = optional_column(header, *aliases["direccion"])
+            sda_indices = [optional_column(header, alias) for alias in
+                           ("SDATOOL - Proyecto", "SDATOOL", "SDA", "Programa SDA")]
+            sda_indices = [index for index in sda_indices if index is not None]
+            start_index = optional_column(header, "Fecha Inicio")
+            end_index = optional_column(header, "Fecha Fin Actual")
+            project_index = optional_column(header, "Proyecto")
+            mesa_index = optional_column(header, "Mesa fábrica 2026", "Mesa Fábrica", "Mesa Asignada")
             for row in rows:
                 row += [""] * max(0, len(header) - len(row))
-                selected = [row[index] if index < len(row) else "" for index in indices]
+                selected = [row[index] if index is not None and index < len(row) else ""
+                            for index in indices.values()]
                 if not any(value.strip() for value in selected):
                     continue
-                combined.append(selected + [direction])
+                get = lambda index: row[index] if index is not None and index < len(row) else ""
+                sda = next((get(index).strip() for index in sda_indices if get(index).strip()), "")
+                start_date = staffing_date(get(start_index))
+                end_date = staffing_date(get(end_index))
+                project = get(project_index).strip()
+                mesa = get(mesa_index).strip()
+                assignment = {
+                    "sda": sda,
+                    "proyecto": project,
+                    "mesa": mesa,
+                    "fecha_inicio": start_date,
+                    "fecha_fin_actual": end_date,
+                    "dedicacion": selected[list(indices).index("% dedicacion")],
+                    "fuente": sheet_name,
+                }
+                combined.append(selected + [sda, start_date, end_date, project, mesa,
+                                             json.dumps(assignment, ensure_ascii=False), sheet_name])
             found.add(direction)
 
         if found != {"system", "data", "arquitectura"}:

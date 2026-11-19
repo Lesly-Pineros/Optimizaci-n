@@ -2,6 +2,7 @@
 """Prepara las matrices de personas e iniciativas para el flujo MILP."""
 
 import csv
+import json
 import re
 import unicodedata
 import zipfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from limpiar_staffing import OUTPUT as STAFFING_FILE, extract_q4
+from mapeo_roles import demand_role_family, person_role_families
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,11 +26,17 @@ PEOPLE_REVIEW_OUTPUT = RESULTS / "Personas que requieren tratamiento.xlsx"
 
 SKILLS_HEADER_ROW = 2
 INITIATIVES_HEADER_ROW = 2
-INITIATIVE_FIRST_ROW = 106
-INITIATIVE_LAST_ROW = 133
 PLANNING_QUARTER = "1Q 2027"
 PLANNING_QUARTER_INDEX = 2027 * 4 + 1
-DOMAIN_BY_DIRECTION = {"operaciones": "ENG"}
+# La matriz fuente corresponde a iniciativas ENG; la Dirección es una dimensión
+# organizacional distinta y no cambia el dominio requerido por estas plazas.
+DOMAIN_BY_DIRECTION = {
+    "fcp": "ENG",
+    "systems": "ENG",
+    "operaciones": "ENG",
+    "ai tech": "ENG",
+    "infraestructura": "ENG",
+}
 
 FILL_DOWN_FIELDS = (
     "Mesa",
@@ -48,7 +56,24 @@ STAFFING_FIELDS = (
     ("rol", "Rol Staffing"),
     ("dominio", "Dominio"),
     ("direccion", "Dirección Staffing"),
+    ("SDATOOL - Proyecto", "SDATOOL - Proyecto"),
+    ("Fecha Inicio", "Fecha Inicio"),
+    ("Fecha Fin Actual", "Fecha Fin Actual"),
+    ("Proyecto", "Proyecto Staffing"),
+    ("Mesa actual", "Mesa Staffing actual"),
 )
+STAFFING_ASSIGNMENTS_COLUMN = "Asignaciones Staffing Q4"
+STAFFING_ASSIGNMENT_SOURCE_COLUMN = "Asignación Staffing"
+STAFFING_STATUS_COLUMN = "Estado Staffing"
+INVALID_VALUES = {"na", "n a", "n/a", "na no aplica", "null", "none", "nan",
+                  "cod eliminado", "codigo eliminado", "eliminado", "sin rol", ""}
+VALID_SENIORITY = {"junior", "mid level", "senior", "lead"}
+SENIORITY_LABELS = {
+    "junior": "Junior",
+    "mid level": "Mid-Level",
+    "senior": "Senior",
+    "lead": "Lead",
+}
 XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 ET.register_namespace("", XLSX_NS)
@@ -89,10 +114,18 @@ def find_column(header, name):
     return matches[0]
 
 
+def normalize_resource_type(value):
+    value = normalize(value)
+    if value == "subsidiaria":
+        return "externo"
+    return value
+
+
 def staffing_by_code():
     _, staffing = read_csv(STAFFING_FILE)
     code_column = find_column(list(staffing[0]), "codigo") if staffing else "codigo"
     grouped = defaultdict(lambda: {source: [] for source, _ in STAFFING_FIELDS})
+    assignments = defaultdict(list)
     for row in staffing:
         code = code_key(row.get(code_column))
         if not code:
@@ -101,8 +134,33 @@ def staffing_by_code():
             value = (row.get(source) or "").strip()
             if value and value not in grouped[code][source]:
                 grouped[code][source].append(value)
-    return {code: {source: " | ".join(values) for source, values in fields.items()}
-            for code, fields in grouped.items()}
+        raw_assignment = row.get(STAFFING_ASSIGNMENT_SOURCE_COLUMN, "")
+        if raw_assignment:
+            try:
+                assignment = json.loads(raw_assignment)
+            except json.JSONDecodeError:
+                assignment = {}
+        else:
+            assignment = {}
+        if not assignment:
+            assignment = {
+                "sda": row.get("SDATOOL - Proyecto", ""),
+                "proyecto": row.get("Proyecto", ""),
+                "mesa": row.get("Mesa actual", ""),
+                "fecha_inicio": row.get("Fecha Inicio", ""),
+                "fecha_fin_actual": row.get("Fecha Fin Actual", ""),
+                "dedicacion": row.get("% dedicacion", ""),
+                "fuente": row.get("fuente staffing", ""),
+            }
+        if any(str(value or "").strip() for value in assignment.values()):
+            assignments[code].append(assignment)
+
+    result = {}
+    for code, fields in grouped.items():
+        result[code] = {source: " | ".join(values) for source, values in fields.items()}
+        result[code][STAFFING_ASSIGNMENTS_COLUMN] = json.dumps(
+            assignments[code], ensure_ascii=False)
+    return result
 
 
 def prepare_people():
@@ -114,6 +172,9 @@ def prepare_people():
     seniority_column = find_column(skills_header, "Nivel del Rol Actual")
     type_column = find_column(skills_header, "Tipo de Recurso")
     output_header = skills_header + [target for _, target in STAFFING_FIELDS]
+    for extra in ("Seniority", STAFFING_STATUS_COLUMN, STAFFING_ASSIGNMENTS_COLUMN):
+        if extra not in output_header:
+            output_header.append(extra)
     code_counts = defaultdict(int)
     for person in people:
         key = code_key(person.get(skills_code_column))
@@ -128,32 +189,38 @@ def prepare_people():
         linked = staffing.get(key, {})
         output = dict(person)
         for source, target in STAFFING_FIELDS:
-            output[target] = linked.get(source, "")
+            output[target] = linked.get(source, "") or output.get(target, "")
+        output[STAFFING_STATUS_COLUMN] = "EN_STAFFING_Q4" if key and key in staffing else "BACKLOG"
+        output[STAFFING_ASSIGNMENTS_COLUMN] = linked.get(STAFFING_ASSIGNMENTS_COLUMN, "[]")
 
         reasons = []
         if not key:
             reasons.append("Código vacío en SkillsCOE")
         elif code_counts[key] > 1:
             reasons.append("Código duplicado en SkillsCOE")
-        if key and key not in staffing:
-            reasons.append("Código de SkillsCOE sin cruce en Staffing Q4")
-        elif key:
+        if key and key in staffing:
             matched_codes.add(key)
 
-        resource_type = normalize(person.get(type_column))
+        resource_type = normalize_resource_type(person.get(type_column))
         if resource_type not in {"interno", "externo"}:
             reasons.append(f"Tipo de recurso no soportado o vacío: {person.get(type_column, '').strip() or 'vacío'}")
-        staffing_types = {normalize(value) for value in linked.get("interno", "").split("|") if normalize(value)}
+        staffing_types = {normalize_resource_type(value) for value in linked.get("interno", "").split("|")
+                          if normalize_resource_type(value)}
         if len(staffing_types) > 1:
             reasons.append("Tipos de recurso contradictorios en Staffing Q4")
         if staffing_types and resource_type in {"interno", "externo"} and resource_type not in staffing_types:
             reasons.append("Tipo de recurso no coincide con Staffing Q4")
-        if not (person.get(role_column) or "").strip():
-            reasons.append("Rol principal vacío")
-        if not (person.get(seniority_column) or "").strip():
-            reasons.append("Nivel del rol actual vacío")
-        if not linked.get("dominio", "").strip():
-            reasons.append("Dominio vacío en Staffing Q4")
+        role_value = normalize(person.get(role_column))
+        if not person_role_families(role_value):
+            reasons.append("Rol principal nulo o basura")
+        seniority_value = normalize(person.get(seniority_column))
+        if seniority_value not in VALID_SENIORITY:
+            reasons.append("Nivel del rol actual vacío o inválido")
+        output["Seniority"] = SENIORITY_LABELS.get(seniority_value, "")
+        domain_value = normalize(output.get("Dominio"))
+        if (not domain_value or domain_value in INVALID_VALUES
+                or domain_value.startswith(("na ", "n a ", "sin dominio"))):
+            reasons.append("Dominio vacío o basura; excluido del pool elegible")
 
         if reasons:
             treatment.append([
@@ -162,7 +229,9 @@ def prepare_people():
                 person.get(role_column, ""), person.get(seniority_column, ""),
                 person.get(type_column, ""), output.get("Tipo de Recurso Staffing", ""),
                 output.get("Dominio", ""), output.get("Dirección Staffing", ""),
-                output.get("% Dedicación Staffing", ""), " | ".join(dict.fromkeys(reasons)),
+                output.get("% Dedicación Staffing", ""), output[STAFFING_STATUS_COLUMN],
+                output.get("SDATOOL - Proyecto", ""), output.get("Fecha Inicio", ""),
+                output.get("Fecha Fin Actual", ""), " | ".join(dict.fromkeys(reasons)),
             ])
         else:
             ready.append(output)
@@ -177,7 +246,8 @@ def prepare_people():
         ("Requieren tratamiento",
          ["Fila SkillsCOE", "Código", "Nombre", "Rol Principal", "Nivel del Rol Actual",
           "Tipo de Recurso", "Tipo de Recurso Staffing", "Dominio Staffing",
-          "Dirección Staffing", "% Dedicación Staffing", "Motivo"], treatment),
+          "Dirección Staffing", "% Dedicación Staffing", "Estado Staffing",
+          "SDATOOL - Proyecto", "Fecha Inicio", "Fecha Fin Actual", "Motivo"], treatment),
     ])
     print(f"Personas listas para MILP: {len(ready)}; con tratamiento: {len(treatment)}; "
           f"códigos con cruce en Staffing Q4: {len(matched_codes)}.")
@@ -205,13 +275,16 @@ def prepare_initiatives():
     filled = {name: "" for name in FILL_DOWN_FIELDS}
     selected = []
     validation_errors = []
-    for excel_row in range(INITIATIVE_FIRST_ROW, INITIATIVE_LAST_ROW + 1):
-        source_index = excel_row - INITIATIVES_HEADER_ROW - 1
-        if source_index >= len(all_rows):
-            break
-        row = dict(all_rows[source_index])
+    excluded = defaultdict(int)
+    unmapped_roles = set()
+    mesa_focus_groups_source = set()
+    source_rows = 0
+    for source_index, source in enumerate(all_rows, start=INITIATIVES_HEADER_ROW + 1):
+        excel_row = source_index
+        row = dict(source)
         if not any((value or "").strip() for value in row.values()):
             continue
+        source_rows += 1
 
         for field in FILL_DOWN_FIELDS:
             actual = indexes[normalize(field)]
@@ -220,6 +293,32 @@ def prepare_initiatives():
                 filled[field] = value
             elif filled[field]:
                 row[actual] = filled[field]
+
+        mesa_value = normalize(row.get(indexes[normalize("Mesa")], ""))
+        focus_value = normalize(row.get(indexes[normalize("Foco estratégico (Fábrica)")], ""))
+        if re.fullmatch(r"mesa\s+\d+", mesa_value) and focus_value:
+            mesa_focus_groups_source.add((mesa_value, focus_value))
+
+        role = row.get(indexes[normalize("Rol")], "")
+        seniority = normalize(row.get(indexes[normalize("Seniority")], ""))
+        seniority = re.sub(r"[-–—]+", " ", seniority)
+        seniority = re.sub(r"\s+", " ", seniority).strip()
+        skill_fields = [name for name in header if normalize(name).startswith(
+            ("habilidades tecnicas obligatorias", "habilidades funcionales obligatorias"))]
+        skill_count = len({normalize(row.get(name, "")) for name in skill_fields
+                           if (row.get(name) or "").strip()})
+        family = demand_role_family(role)
+        if family is None:
+            excluded["rol sin mapeo"] += 1
+            if role.strip():
+                unmapped_roles.add(role.strip())
+            continue
+        if seniority not in VALID_SENIORITY:
+            excluded["seniority vacío o no homologado"] += 1
+            continue
+        if skill_count < 1:
+            excluded["sin skills obligatorias solicitadas"] += 1
+            continue
 
         for field in REQUIRED_FILLED_FIELDS:
             if not (row.get(indexes[normalize(field)]) or "").strip():
@@ -238,7 +337,7 @@ def prepare_initiatives():
     if validation_errors:
         raise ValueError("Hay filas sin contexto requerido:\n" + "\n".join(validation_errors))
     if not selected:
-        raise ValueError(f"No hay filas con contenido entre {INITIATIVE_FIRST_ROW} y {INITIATIVE_LAST_ROW}.")
+        raise ValueError("No hay iniciativas que cumplan rol, seniority y skills obligatorias.")
 
     output_header = list(header)
     if normalize("Dominio") not in indexes:
@@ -250,7 +349,17 @@ def prepare_initiatives():
         writer.writeheader()
         writer.writerows(selected)
 
-    print(f"Iniciativas cargadas sin filtrar por fechas: {len(selected)} filas.")
+    print(f"Iniciativas revisadas: {source_rows}; conservadas: {len(selected)}; "
+          f"exclusiones: {dict(excluded)}.")
+    eligible_groups = {
+        (normalize(row.get(indexes[normalize("Mesa")], "")),
+         normalize(row.get(indexes[normalize("Foco estratégico (Fábrica)")], "")))
+        for row in selected
+    }
+    print(f"Grupos Mesa + Foco estratégico: {len(mesa_focus_groups_source)} en la matriz; "
+          f"{len(eligible_groups)} con demanda elegible.")
+    if unmapped_roles:
+        print(f"Roles que requieren mapeo en mapeo_roles.py: {sorted(unmapped_roles)}")
 
 
 def excel_column(number):
@@ -331,17 +440,22 @@ def prepare_unmatched_report():
 
     skills_only = [
         [row.get(skills_code_column, ""), row.get(skills_name_column, ""),
-         row.get(skills_role_column, ""), row.get(skills_type_column, "")]
+         row.get(skills_role_column, ""), row.get(skills_type_column, ""), "BACKLOG"]
         for code, row in sorted(skills_by_code.items()) if code not in staffing_by_person
     ]
     staffing_only = [
         [row.get("codigo", ""), row.get("interno", ""), row.get("% dedicacion", ""),
-         row.get("rol", ""), row.get("dominio", ""), row.get("direccion", "")]
+         row.get("rol", ""), row.get("dominio", ""), row.get("direccion", ""),
+         row.get("SDATOOL - Proyecto", ""), row.get("Fecha Inicio", ""),
+         row.get("Fecha Fin Actual", ""), row.get("Mesa actual", "")]
         for code, row in sorted(staffing_by_person.items()) if code not in skills_by_code
     ]
     write_review_workbook(UNMATCHED_OUTPUT, [
-        ("Skills sin Staffing", ["Código", "Nombre", "Rol Principal", "Tipo de Recurso"], skills_only),
-        ("Staffing sin Skills", ["codigo", "interno", "% dedicacion", "rol", "dominio", "direccion"], staffing_only),
+        ("Skills sin Staffing", ["Código", "Nombre", "Rol Principal", "Tipo de Recurso",
+                                 "Estado Staffing"], skills_only),
+        ("Staffing sin Skills", ["codigo", "interno", "% dedicacion", "rol", "dominio", "direccion",
+                                  "SDATOOL - Proyecto", "Fecha Inicio", "Fecha Fin Actual", "Mesa actual"],
+         staffing_only),
     ])
     print(f"Sin cruce: {len(skills_only)} códigos en SkillsCOE sin Staffing; {len(staffing_only)} en Staffing sin SkillsCOE.")
     print(f"Excel de revisión: {UNMATCHED_OUTPUT}")

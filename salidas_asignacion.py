@@ -1,5 +1,6 @@
 """Exporta un To-Be XLSX sin dependencias adicionales de escritura."""
 from pathlib import Path
+import re
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -13,101 +14,215 @@ def _col(n):
 
 
 def write_xlsx(path, headers, rows, sheet_name="Asignaciones"):
-    """Escribe un libro sencillo con texto inline, compatible con Excel/LibreOffice."""
+    """Escribe un libro de una hoja, compatible con Excel/LibreOffice."""
+    write_xlsx_sheets(path, [(sheet_name, headers, rows)])
+
+
+def write_xlsx_sheets(path, sheets):
+    """Escribe un libro con varias hojas y celdas de texto inline."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    all_rows = [headers] + [[row.get(h, "") for h in headers] for row in rows]
-    xml_rows = []
-    for ri, row in enumerate(all_rows, 1):
-        cells = []
-        for ci, value in enumerate(row, 1):
-            ref = f"{_col(ci)}{ri}"
-            value = "" if value is None else str(value)
-            cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{escape(value)}</t></is></c>')
-        xml_rows.append(f'<row r="{ri}">{"".join(cells)}</row>')
-    sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-             f'<sheetData>{"".join(xml_rows)}</sheetData></worksheet>')
-    workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                f'<sheets><sheet name="{escape(sheet_name[:31])}" sheetId="1" r:id="rId1"/></sheets></workbook>')
     with ZipFile(path, "w", ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?>'
                     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
                     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
                     '<Default Extension="xml" ContentType="application/xml"/>'
                     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-                    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-                    '</Types>')
+                    + ''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                              for i in range(1, len(sheets) + 1)) + '</Types>')
         zf.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?>'
                     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
                     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
                     '</Relationships>')
-        zf.writestr("xl/workbook.xml", workbook)
+        workbook_sheets = ''.join(
+            f'<sheet name="{escape(name[:31])}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (name, _, _) in enumerate(sheets, 1))
+        zf.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                    f'<sheets>{workbook_sheets}</sheets></workbook>')
+        rels = ''.join(
+            f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sheets) + 1))
         zf.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?>'
                     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-                    '</Relationships>')
-        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+                    + rels + '</Relationships>')
+        for sheet_index, (sheet_name, headers, rows) in enumerate(sheets, 1):
+            all_rows = [headers] + [[row.get(h, "") for h in headers] for row in rows]
+            xml_rows = []
+            for ri, row in enumerate(all_rows, 1):
+                cells = []
+                for ci, value in enumerate(row, 1):
+                    ref = f"{_col(ci)}{ri}"
+                    value = "" if value is None else str(value)
+                    cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{escape(value)}</t></is></c>')
+                xml_rows.append(f'<row r="{ri}">{"".join(cells)}</row>')
+            sheet_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                         f'<sheetData>{"".join(xml_rows)}</sheetData></worksheet>')
+            zf.writestr(f"xl/worksheets/sheet{sheet_index}.xml", sheet_xml)
 
 
-def export_tobe(path, source_header, projects, slots, selected, people, skill_fit, skill_fields):
-    """Una fila por fila fuente; detalle de varios slots en celdas multilínea."""
+def export_tobe(path, source_header, projects, slots, selected, people, skill_fit, skill_fields,
+                role_map=None, recommendation_pool=None):
+    """Entrega una sola hoja: datos A:R, asignación y recomendaciones al final."""
     from collections import defaultdict
     import asignacion_milp as base
-    assignment_counts = defaultdict(int)
-    for _slot, person_index, _score in selected:
-        assignment_counts[person_index] += 1
-    by_source = defaultdict(list)
-    for slot, person_index, _score in selected:
-        source_row, project = slots[slot]
-        person = people[person_index]
-        covered = []
-        for field in skill_fields:
-            name = project.get(field, "")
-            normalized = __import__("asignacion_milp").norm(name)
-            level = person["skills"].get(normalized, 0)
-            if name.strip() and level > 0:
-                covered.append(f"{name.strip()} (nivel {level})")
-        expected = base.SENIORITY_SKILL_LEVEL.get(base.norm(project.get("Seniority")), 1)
-        missing = []
+    role_map = role_map or {}
+    recommendation_pool = recommendation_pool or {}
+    assignments = {slot: (person, score) for slot, person, score in selected}
+    source_fields = list(source_header[:18])
+    extra_fields = [
+        "Dominio requerido", "Fila origen", "N.º plaza", "Tipo requerido", "Estado asignación",
+        "Motivo sin asignar", "Persona asignada", "Código persona", "Origen de asignación", "Rol persona",
+        "Seniority persona", "Ajuste seniority", "Tipo persona", "Ajuste tipo de recurso", "Dominio persona",
+        "Porcentaje coincidencia skills obligatorias",
+        "Puntaje skills obligatorias",
+        "Comentario skills obligatorias",
+        "Skills obligatorias coincidentes", "Skills con match", "Skills faltantes",
+        "SDATOOL - Proyecto Staffing actual",
+        "Fecha Inicio Staffing actual", "Fecha Fin Actual Staffing", 
+        "% Dedicación Staffing actual",
+        "Candidatos adicionales sugeridos DEV/QA",
+    ]
+    assignment_headers = source_fields + extra_fields
+
+    def skill_report(project, person):
+        required = []
+        seen = set()
         for field in base.TECH_FIELDS + base.FUNCTIONAL_FIELDS:
-            name = project.get(field, "")
-            if not name.strip():
-                continue
-            level = person["skills"].get(base.norm(name), 0)
-            if level < expected:
-                missing.append(f"{name.strip()} (nivel {level}; requiere {expected})")
-        by_source[int(source_row)].append({
-            "Nombre": person["name"], "Código": person["code"],
-            "Rol": person["role_raw"], "Seniority": person["seniority_raw"],
-            "Skills": "; ".join(covered) or "Sin skill coincidente",
-            "Missing": "; ".join(missing) or "Ninguna",
-            "Capacity": (f"Asignada a {assignment_counts[person_index]} plazas; capacidad base 1"
-                         if assignment_counts[person_index] > base.MAX_ASSIGNMENTS_PER_PERSON else ""),
-            "Tipo": project.get("_required_type", ""),
-        })
-    headers = list(source_header) + ["Personas asignadas", "Códigos asignados", "Roles persona",
-                                      "Seniority personas", "Tipo de asignación", "Skills con match (nivel)",
-                                      "Skills faltantes", "Alerta de capacidad"]
-    output = []
-    for idx, project in enumerate(projects, 2):
-        try:
-            source_id = int(project.get("Fila origen") or idx)
-        except ValueError:
-            source_id = idx
-        assigned = by_source.get(source_id, [])
-        row = {h: project.get(h, "") for h in source_header}
+            raw_name = (project.get(field) or "").strip()
+            normalized = base.norm(raw_name)
+            if raw_name and normalized not in seen:
+                required.append((raw_name, normalized))
+                seen.add(normalized)
+        matched, missing = [], []
+        for raw_name, normalized in required:
+            value = person["skills"].get(normalized, 0)
+            if value > 0:
+                matched.append(f"{raw_name} (nivel {value})")
+            else:
+                missing.append(f"{raw_name} (sin skill registrada)")
+        percent = f"{100 * len(matched) / len(required):.1f}%" if required else "N/A"
+        ratio = f"{len(matched)}/{len(required)}" if required else "0/0"
+        return (percent, ratio, "; ".join(matched), "; ".join(missing),
+                len(matched), base.skill_observation(project, person, role_map))
+
+    assigned_by_mesa = defaultdict(set)
+    assigned_types = defaultdict(set)
+    eligible_types_by_mesa = defaultdict(set)
+    for _slot, (_source_row, project) in enumerate(slots):
+        mesa = base.mesa_group_key(project)
+        for candidate in people:
+            if base.eligibility(project, candidate, set(), role_map)[0]:
+                eligible_types_by_mesa[mesa].add(candidate["resource_type"])
+    for slot, person_index, _ in selected:
+        project = slots[slot][1]
+        mesa = base.mesa_group_key(project)
+        assigned_by_mesa[mesa].add(person_index)
+        assigned_types[mesa].add(people[person_index]["resource_type"])
+
+    assignment_rows = []
+    for slot_index, (source_row, project) in enumerate(slots):
+        person_index, score = assignments.get(slot_index, (None, ""))
+        if person_index is None:
+            mesa_key = base.mesa_group_key(project)
+            candidates = [i for i, candidate in enumerate(people)
+                          if base.eligibility(project, candidate, set(), role_map)[0]]
+            if not candidates:
+                reason = base.diagnose_no_candidate(project, people, set(), role_map)
+            elif (eligible_types_by_mesa[mesa_key] == {"interno", "externo"}
+                  and assigned_types[mesa_key] != {"interno", "externo"}
+                  and assigned_by_mesa[mesa_key]):
+                reason = "La Mesa no cumple la mezcla interna/externa requerida"
+            elif (eligible_types_by_mesa[mesa_key] == {"interno", "externo"}
+                  and not assigned_by_mesa[mesa_key]):
+                reason = "Mesa sin asignar: no fue posible asegurar presencia interna y externa"
+            else:
+                reason = "Capacidad o solapamiento de proyectos"
+            person = None
+            percent, ratio, matched, missing, skill_score, skill_note = "", "", "", "", "", ""
+            status = "Vacante"
+        else:
+            person = people[person_index]
+            reason = ""
+            percent, ratio, matched, missing, skill_score, skill_note = skill_report(project, person)
+            status = "Asignada"
+        origin = ""
+        if person_index is not None:
+            origin = ("Candidato sugerido adicional"
+                      if person_index in recommendation_pool.get(base.mesa_group_key(project), [])
+                      else "Asignación base")
+
+        row = {field: project.get(field, "") for field in source_fields}
         row.update({
-            "Personas asignadas": "\n".join(p["Nombre"] for p in assigned),
-            "Códigos asignados": "\n".join(p["Código"] for p in assigned),
-            "Roles persona": "\n".join(p["Rol"] for p in assigned),
-            "Seniority personas": "\n".join(p["Seniority"] for p in assigned),
-            "Tipo de asignación": "\n".join(p["Tipo"] for p in assigned),
-            "Skills con match (nivel)": "\n".join(p["Skills"] for p in assigned),
-            "Skills faltantes": "\n".join(f"{p['Nombre']}: {p['Missing']}" for p in assigned),
-            "Alerta de capacidad": "\n".join(f"{p['Nombre']}: {p['Capacity']}" for p in assigned if p["Capacity"]),
+            "Dominio requerido": project.get("Dominio", ""),
+            "Fila origen": source_row,
+            "N.º plaza": project.get("_slot_number", ""),
+            "Tipo requerido": project.get("_required_type", ""),
+            "Estado asignación": status,
+            "Motivo sin asignar": reason,
+            "Persona asignada": person["name"] if person else "",
+            "Código persona": person["code"] if person else "",
+            "Origen de asignación": origin,
+            "Rol persona": person["role_raw"] if person else "",
+            "Seniority persona": person["seniority_raw"] if person else "",
+            "Ajuste seniority": ({2: "Exacto", 1: "Un nivel por encima", 0: "Un nivel por debajo"}[
+                base.seniority_fit(project.get("Seniority"), person["seniority"])] if person else ""),
+            "Tipo persona": person["resource_type"] if person else "",
+            "Ajuste tipo de recurso": (
+                "Exacto" if person and person["resource_type"] == project.get("_required_type")
+                else (f"Sustitución: {person['resource_type']} cubre plaza {project.get('_required_type')}"
+                      if person else "")),
+            "Dominio persona": " | ".join(sorted(person.get("domains", set()))) if person else "",
+            "Porcentaje coincidencia skills obligatorias": percent,
+            "Puntaje skills obligatorias": skill_score,
+            "Comentario skills obligatorias": skill_note,
+            "Skills obligatorias coincidentes": ratio,
+            "Skills con match": matched,
+            "Skills faltantes": missing,
+            **({key: value for key, value in base.current_staffing_fields(person).items()
+                if key != "Asignaciones Staffing Q4 (detalle)"} if person else {
+                    "SDATOOL - Proyecto Staffing actual": "",
+                    "Fecha Inicio Staffing actual": "",
+                    "Fecha Fin Actual Staffing": "",
+                    "% Dedicación Staffing actual": "",
+                }),
         })
-        output.append(row)
-    write_xlsx(path, headers, output)
+        assignment_rows.append(row)
+
+    def mesa_sort(value):
+        match = re.search(r"\d+", str(value or ""))
+        return (int(match.group()) if match else 10**9, base.norm(value))
+
+    assignment_rows.sort(key=lambda row: (
+        mesa_sort(row.get("Mesa")), base.norm(row.get("Foco estratégico (Fábrica)")),
+        base.norm(row.get("Nombre Proyecto")),
+        base.norm(row.get("Rol")), base.norm(row.get("Tipo requerido")),
+        int(row.get("N.º plaza") or 0), int(row.get("Fila origen") or 0)))
+
+    recommendations = base.recommend_candidates(slots, selected, people, role_map)
+    commitments_by_person = defaultdict(list)
+    for slot, person_index, _score in selected:
+        project = slots[slot][1]
+        commitments_by_person[person_index].append(
+            f"{project.get('Mesa', '')} / {project.get('Nombre Proyecto', '')}")
+    seen_mesas = set()
+    for row in assignment_rows:
+        mesa = base.mesa_group_key(row)
+        if mesa in seen_mesas:
+            row["Candidatos adicionales sugeridos DEV/QA"] = ""
+            continue
+        seen_mesas.add(mesa)
+        names = []
+        for index in recommendations.get(mesa, []):
+            person = people[index]
+            commitments = commitments_by_person.get(index, [])
+            availability = ("Opcional; comprometido en To-Be: " + "; ".join(commitments)
+                            if commitments else
+                            f"Opcional; sin asignación To-Be ({person.get('staffing_status', 'disponible')})")
+            names.append(f"{person['name']} [{person['code']}] — "
+                         f"{person['role_raw']}, {person['seniority_raw']}, "
+                         f"{person['resource_type']}; {availability}")
+        row["Candidatos adicionales sugeridos DEV/QA"] = "\n".join(names)
+    write_xlsx(path, assignment_headers, assignment_rows, sheet_name="Asignaciones")
