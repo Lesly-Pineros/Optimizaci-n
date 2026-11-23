@@ -16,22 +16,25 @@ from salidas_asignacion import export_tobe
 from mapeo_roles import demand_role_family, person_role_families
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "DATA"
 INPUTS = ROOT / "RESULTADOS_LIMPIEZA"
 RESULTS = ROOT / "RESULTADOS MODELOS"
 PEOPLE_FILE = INPUTS / "Matriz SkillsCOE enriquecida.csv"
-PROJECT_FILE = INPUTS / "GRM-iniciativas con skills.csv"
-STAFFING_FILE = DATA / "STAFFING.csv"
-ASSIGNMENTS_FILE = RESULTS / "Asignaciones GRM MILP.csv"
-UNFILLED_FILE = RESULTS / "Plazas GRM sin asignar MILP.csv"
-ROLE_MATCH_FILE = RESULTS / "Similitud de roles GRM.csv"
-EXCEL_FILE = RESULTS / "Asignacion GRM To-Be_Baseline.xlsx"
+PROJECT_FILES = INPUTS
+# Dominios incluidos en el modelo conjunto. Agrega aquí otros dominios cuando
+# también deban asignarse; limpieza.py ya puede depurarlos desde el workbook.
+ASSIGNMENT_DOMAINS = {"ENG", "GRM"}
+ASSIGNMENTS_FILE = RESULTS / "Asignaciones ENG-GRM MILP.csv"
+UNFILLED_FILE = RESULTS / "Plazas ENG-GRM sin asignar MILP.csv"
+ROLE_MATCH_FILE = RESULTS / "Similitud de roles ENG-GRM.csv"
+EXCEL_FILE = RESULTS / "Asignacion ENG-GRM To-Be_Baseline.xlsx"
 
 MAX_BASE_ASSIGNMENTS_PER_GROUP = 7
-MAX_SUGGESTED_PER_MESA = 5
+MAX_SUGGESTED_PER_MESA = 3
 MAX_SIMULTANEOUS_PROJECTS = 2
-MIN_SKILLS_PER_ROLE = 1
+# Se conserva una iniciativa con al menos una skill obligatoria; QA admite cero.
+MIN_REQUIRED_SKILLS_PER_PROJECT = 1
 NO_SKILL_MATCH_PENALTY = 10
+ONE_SKILL_MATCH_PENALTY = 5
 SENIORITY_ORDER = {"junior": 1, "mid level": 2, "senior": 3, "lead": 4}
 
 
@@ -43,15 +46,11 @@ def seniority_fit(project_seniority, person_seniority):
         return None
     # Un valor mayor expresa preferencia lexicográfica: exacto > superior > inferior.
     return 2 if actual == requested else (1 if actual > requested else 0)
-# Mapeo de Dirección a Dominio cuando la fuente no proporciona el dominio.
-LEADER_ROLE_MARKERS = ("lider", "lead", "tech manager")
-TESTING_ROLE_MARKERS = ("qa", "test", "testing", "tester", "quality")
-INVALID_ROLE_MARKERS = ("na ", "n a ", "cod eliminado", "codigo eliminado", "retirado")
 HORIZON_START = date(2027, 1, 1)
 HORIZON_END = date(2027, 6, 30)
 
 FILL_DOWN_PROJECT_FIELDS = [
-    "Mesa", "Foco estratégico (Fábrica)", "SDATOOL", "Nombre Proyecto",
+    "Mesa", "Foco estratégico (Fábrica)", "Nombre Proyecto",
     "Fecha Inicio", "Fecha Fin", "Dominio", "Estado", "Workspace",
 ]
 TECH_FIELDS = [f"Habilidades técnicas obligatorias {i}" for i in range(1, 6)]
@@ -67,6 +66,11 @@ def norm(value):
 
 def key(value):
     return re.sub(r"[^A-Z0-9]", "", unicodedata.normalize("NFKC", str(value or "")).upper())
+
+
+def sda_tokens(value):
+    """Separa SDAs agrupadas en una celda y crea claves comparables."""
+    return {key(part) for part in re.split(r"[|;,\n]+", str(value or "")) if key(part)}
 
 
 def read_csv(path, header_row=0):
@@ -158,9 +162,7 @@ def staffing_project_periods(person):
 
 
 def staffing_matches_project(assignment, project):
-    staffing_sda = key(assignment.get("sda"))
-    project_sda = key(project.get("SDATOOL"))
-    if staffing_sda and project_sda and staffing_sda == project_sda:
+    if sda_tokens(assignment.get("sda")) & sda_tokens(project.get("SDATOOL")):
         return True
     staffing_name = norm(assignment.get("proyecto"))
     project_name = norm(project.get("Nombre Proyecto"))
@@ -240,30 +242,25 @@ def demand_family(value, domain=None):
 def qa_without_skills(project, role_map=None):
     role = (role_map or {}).get(norm(project.get("Rol")),
             demand_family(project.get("Rol"), project.get("Dominio")))
-    no_skills = not any(
-        (project.get(field) or "").strip()
-        for field in TECH_FIELDS + FUNCTIONAL_FIELDS + SUGGESTED_FIELDS
-    )
+    no_skills = not any((project.get(field) or "").strip()
+                        for field in TECH_FIELDS + FUNCTIONAL_FIELDS)
     return role == "QA" and no_skills
 
 
 def skill_match_penalty(project, person, role_map=None):
-    if qa_without_skills(project, role_map):
+    covered = skill_fit(project, person, role_map)[0]
+    required_count = len(set(required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)))
+    if qa_without_skills(project, role_map) or covered == 0:
         return NO_SKILL_MATCH_PENALTY
-    if (project.get("_allow_no_skill_fallback")
-            and skill_fit(project, person, role_map)[0] == 0):
-        return NO_SKILL_MATCH_PENALTY
+    if required_count >= 2 and covered == 1:
+        return ONE_SKILL_MATCH_PENALTY
     return 0
 
 
 def role_compatible(role, person):
-    """Aplica las familias GRM y mantiene a Dev Int como rol interno estricto."""
+    """Comprueba igualdad entre las familias canónicas DEV, QA y LT."""
     families = person.get("families") or role_families(
         person.get("role_raw", person.get("role", "")), person.get("seniority_raw"))
-    if role == "DEV_INT":
-        return "DEV" in families and person.get("resource_type") == "interno"
-    if role == "DEV_EXT":
-        return "DEV" in families and person.get("resource_type") in {"interno", "externo"}
     return bool(role and role in families)
 
 
@@ -288,33 +285,47 @@ def current_staffing_assignment(row):
 
 
 def load_projects():
-    header, rows = read_csv(PROJECT_FILE)
-    filled = []
-    previous = {name: "" for name in FILL_DOWN_PROJECT_FIELDS}
-    for source in rows:
+    """Carga conjuntamente todos los dominios ya depurados."""
+    paths = sorted(PROJECT_FILES.glob("*-iniciativas con skills.csv"))
+    if not paths:
+        raise FileNotFoundError(f"No hay iniciativas depuradas en {PROJECT_FILES}")
+    all_rows, headers = [], []
+    for path in paths:
+        header, rows = read_csv(path)
+        headers.extend(name for name in header if name not in headers)
+        all_rows.extend(rows)
+    previous_by_domain = defaultdict(lambda: {name: "" for name in FILL_DOWN_PROJECT_FIELDS})
+    retained, excluded_roles = [], Counter()
+    for source in all_rows:
         row = dict(source)
+        domain = (row.get("Dominio") or "").strip().upper()
+        if domain not in ASSIGNMENT_DOMAINS:
+            continue
+        previous = previous_by_domain[domain]
         for field in FILL_DOWN_PROJECT_FIELDS:
             value = (row.get(field) or "").strip()
             if value:
                 previous[field] = value
             elif previous[field]:
                 row[field] = previous[field]
-        filled.append(row)
-    retained = []
-    for row in filled:
-        row["Dominio"] = "GRM"
+        row["Dominio"] = domain
+        family = demand_family(row.get("Rol"), domain)
+        if family not in {"DEV", "QA", "LT"}:
+            excluded_roles[(domain, row.get("Rol", ""))] += 1
+            continue
+        if norm(row.get("Seniority")) not in SENIORITY_ORDER:
+            continue
         skill_count = len(set(required_skill_names(row, TECH_FIELDS + FUNCTIONAL_FIELDS)))
-        role_defined = demand_family(row.get("Rol"), row.get("Dominio")) is not None
-        family = demand_family(row.get("Rol"), row.get("Dominio"))
-        no_skills_diligenced = qa_without_skills(row)
-        seniority_defined = norm(row.get("Seniority")) in SENIORITY_ORDER
-        skills_rule_ok = (skill_count >= MIN_SKILLS_PER_ROLE
-                          or (family == "QA" and no_skills_diligenced))
-        if role_defined and seniority_defined and skills_rule_ok:
-            retained.append(row)
-    print(f"Iniciativas GRM filtradas: {len(retained)} conservadas de {len(filled)} "
-          "(GRM, rol y seniority válidos; QA sin skills también se admite).")
-    return header, retained
+        if skill_count < MIN_REQUIRED_SKILLS_PER_PROJECT and not (family == "QA" and skill_count == 0):
+            continue
+        row["Rol"] = family
+        retained.append(row)
+    print(f"Iniciativas de {', '.join(sorted(ASSIGNMENT_DOMAINS))}: "
+          f"{len(retained)} demandas conservadas "
+          f"de {len(all_rows)} filas depuradas.")
+    if excluded_roles:
+        print(f"Roles de iniciativas excluidos por no estar en DEV/QA/LT: {dict(excluded_roles)}")
+    return headers, retained
 
 
 def load_people():
@@ -327,9 +338,16 @@ def load_people():
             continue
         seen.add(person_key)
         direction = (row.get("Dominio") or "").strip()
+        role_family = demand_family(row.get("Rol Principal"))
+        # Sin dominio, rol o tipo de recurso válido no se asigna. Los perfiles
+        # BACKLOG siguen siendo elegibles si esas fuentes sí tienen los datos.
+        if not direction.strip() or not role_family:
+            continue
         resource_type = norm(row.get("Tipo de Recurso"))
         if resource_type == "subsidiaria":
             resource_type = "externo"
+        if resource_type not in {"interno", "externo"}:
+            continue
         current = current_staffing_assignment(row)
         assignments_raw = row.get("Asignaciones Staffing Q4", "")
         try:
@@ -342,18 +360,19 @@ def load_people():
             "key": person_key,
             "code": (row.get("Código") or "").strip(),
             "name": (row.get("Nombre") or "").strip(),
-            "role": norm(row.get("Rol Principal")),
-            "role_raw": (row.get("Rol Principal") or "").strip(),
+            "role": role_family,
+            "role_raw": role_family,
             "seniority": norm(seniority_raw),
             "seniority_raw": seniority_raw,
             "company": norm(row.get("Empresa")),
             "resource_type": {"interno": "interno", "externo": "externo"}.get(resource_type, ""),
             "direction": direction,
+            "staffing_direction": (row.get("Dirección Staffing") or "").strip(),
             "domains": {norm(value) for value in direction.split("|") if norm(value)},
             # El SDA seleccionado proviene de SDATOOL - Proyecto, emparejado con
             # el registro de mayor dedicación en el detalle de Staffing enriquecido.
             "staffing_sda": current.get("sda") or row.get("SDATOOL - Proyecto", ""),
-            "families": role_families(row.get("Rol Principal"), seniority_raw),
+            "families": {role_family},
             "staffing_status": row.get("Estado Staffing", ""),
             "staffing_assignments": assignments,
             "current_assignment": current,
@@ -385,59 +404,31 @@ def required_skill_names(row, fields):
     return [norm(row.get(field)) for field in fields if (row.get(field) or "").strip()]
 
 
-def numeric_tokens(value):
-    """Identificadores numéricos completos de Mesa/SDA (no compara dígitos parciales)."""
-    return set(re.findall(r"\d+", norm(value)))
-
-
-def labels_match_by_text_or_number(left, right):
-    left_norm, right_norm = norm(left), norm(right)
-    if not left_norm or not right_norm:
-        return False
-    left_parts = {norm(part) for part in str(left or "").split("|") if norm(part)}
-    right_parts = {norm(part) for part in str(right or "").split("|") if norm(part)}
-    if left_parts & right_parts:
-        return True
-    return bool(numeric_tokens(left_norm) & numeric_tokens(right_norm))
-
-
 def skill_fit(project, person, role_map=None):
     """Cuenta skills obligatorias registradas, sin filtrar por nivel."""
     required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
+    # Cualquier nivel positivo cuenta; el mínimo por seniority está desactivado.
     levels = [person["skills"].get(skill, 0) for skill in required]
     covered = sum(value > 0 for value in levels)
-    known = sum(value > 0 for value in levels)
+    known = covered
     return covered, len(required), known, None, covered
 
 
 def skill_observation(project, person, role_map=None):
-    """Explica el respaldo sin match o el caso de skill LT en nivel Básico."""
-    if skill_match_penalty(project, person, role_map):
-        return "Sin match de skills; se aplicó respaldo con penalización de -10 puntos."
-    role = (role_map or {}).get(norm(project.get("Rol")),
-            demand_family(project.get("Rol"), project.get("Dominio")))
-    if role != "LT":
-        return ""
-    required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
-    if any(person["skills"].get(skill, 0) == 1 for skill in required):
-        return "LT: cumple al menos una skill obligatoria, pero en nivel Básico (1)."
+    """Describe penalización cuando solo coincide una skill o ninguna."""
+    penalty = skill_match_penalty(project, person, role_map)
+    if penalty == NO_SKILL_MATCH_PENALTY:
+        return f"Sin coincidencia de skills obligatorias; penalización de -{penalty}."
+    if penalty == ONE_SKILL_MATCH_PENALTY:
+        return f"Solo una skill obligatoria coincide; penalización de -{penalty}."
     return ""
 
 
 def affinity_components(project, person):
-    """Return the continuity and Domain preference components."""
+    """Devuelve continuidad por SDA del grupo y coincidencia de Dominio."""
     current = person.get("current_assignment", {})
     staffing_sda = person.get("staffing_sda", current.get("sda", ""))
-    current_project = norm(current.get("proyecto"))
-    current_mesa = norm(current.get("mesa"))
-    initiative_sda = project.get("SDATOOL", "")
-    project_name = norm(project.get("Nombre Proyecto"))
-    project_mesa = norm(project.get("Mesa"))
-    continuity = int(bool(
-        labels_match_by_text_or_number(current_mesa, project_mesa)
-        or labels_match_by_text_or_number(staffing_sda, initiative_sda)
-        or (current_project and project_name and current_project == project_name)
-    ))
+    continuity = int(bool(sda_tokens(staffing_sda) & sda_tokens(project.get("SDATOOL"))))
     domain = norm(project.get("Dominio", ""))
     domains = person.get("domains") or {
         norm(value) for value in str(person.get("direction", "")).split("|") if norm(value)
@@ -449,26 +440,28 @@ def affinity_components(project, person):
 def affinity_score(project, person, role_map=None):
     continuity, domain_match = affinity_components(project, person)
     matched_skills = skill_fit(project, person, role_map)[0]
-    return continuity * 1000 + domain_match * 100 + matched_skills
+    return continuity * 1000 + domain_match * 100 + matched_skills - skill_match_penalty(
+        project, person, role_map)
 
 
 def combined_preference_score(project, person, number_of_slots, role_map=None):
-    """Ordena por continuidad, Dominio y finalmente skills obligatorias cubiertas."""
+    """Prioriza continuidad; después afinidad de dominio y skills."""
     continuity, domain_match = affinity_components(project, person)
     matched_skills = skill_fit(project, person, role_map)[0]
     max_skills = len(TECH_FIELDS) + len(FUNCTIONAL_FIELDS)
     skill_total_ceiling = number_of_slots * max_skills
     domain_weight = skill_total_ceiling + 1
     continuity_weight = number_of_slots * (domain_weight + max_skills) + 1
-    return continuity * continuity_weight + domain_match * domain_weight + matched_skills
+    return (continuity * continuity_weight + domain_match * domain_weight + matched_skills
+            - skill_match_penalty(project, person, role_map))
 
 
-def eligibility(project, person, skill_columns, role_map, allow_skillless=False):
+def eligibility(project, person, skill_columns, role_map):
     mapped_role = role_map.get(norm(project.get("Rol")))
-    role = mapped_role if mapped_role in {"LT", "DEV", "QA", "DEV_INT", "DEV_EXT"} else demand_family(
+    role = mapped_role if mapped_role in {"LT", "DEV", "QA"} else demand_family(
         project.get("Rol"), project.get("Dominio"))
     seniority = norm(project.get("Seniority"))
-    if not role or not role_compatible(role, person):
+    if role not in {"DEV", "QA", "LT"} or not role_compatible(role, person):
         return False, 0, "rol"
     if seniority_fit(seniority, person["seniority"]) is None:
         return False, 0, "seniority"
@@ -481,50 +474,25 @@ def eligibility(project, person, skill_columns, role_map, allow_skillless=False)
         norm(value) for value in str(person.get("direction", "")).split("|") if norm(value)
     }
     required_domain = norm(project.get("Dominio"))
-    if not required_domain or required_domain not in person_domains:
-        return False, 0, "dominio distinto de " + (project.get("Dominio") or "la iniciativa")
-
-    if role == "LT" and (required_type != "interno" or person.get("resource_type") != "interno"):
-        return False, 0, "LT solo BBVA y sin sustitución de tipo"
+    if role == "LT" and person.get("resource_type") != "interno":
+        return False, 0, "LT solo personal interno del banco"
 
     required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
-    skillless_fallback = (allow_skillless or project.get("_allow_no_skill_fallback")
-                          or qa_without_skills(project, role_map))
-    if len(required) < MIN_SKILLS_PER_ROLE and not skillless_fallback:
-        return False, 0, "sin skills obligatorias en la demanda"
     covered, _, _, _, _ = skill_fit(project, person, role_map)
-    if covered < MIN_SKILLS_PER_ROLE and not skillless_fallback:
-        return False, 0, "ninguna skill obligatoria registrada"
+    continuity, _ = affinity_components(project, person)
+    domain_match = bool(required_domain and required_domain in person_domains)
+    if covered == 0 and not domain_match:
+        return False, 0, "respaldo sin skills requiere Dominio coincidente"
 
     display_score = affinity_score(project, dict(person, domains=person_domains), role_map)
-    display_score -= skill_match_penalty(project, person, role_map)
     return True, display_score, ""
-
-
-def prepare_skill_fallbacks(slots, people, role_map):
-    """Enciende respaldo de skills solo si ningún candidato elegible tiene match."""
-    for _, project in slots:
-        if qa_without_skills(project, role_map):
-            project["_allow_no_skill_fallback"] = True
-            continue
-        required = required_skill_names(project, TECH_FIELDS + FUNCTIONAL_FIELDS)
-        if not required:
-            project["_allow_no_skill_fallback"] = False
-            continue
-        has_skill_candidate = any(
-            eligibility(project, person, set(), role_map, allow_skillless=True)[0]
-            and staffing_capacity_allows_project(person, project)
-            and skill_fit(project, person, role_map)[0] >= MIN_SKILLS_PER_ROLE
-            for person in people
-        )
-        project["_allow_no_skill_fallback"] = not has_skill_candidate
 
 
 def diagnose_no_candidate(project, people, skill_columns, role_map):
     """Devuelve el primer criterio que deja la plaza sin candidatos."""
     pool = people
     mapped = role_map.get(norm(project.get("Rol")))
-    role = mapped if mapped in {"LT", "DEV", "QA", "DEV_INT", "DEV_EXT"} else demand_family(
+    role = mapped if mapped in {"LT", "DEV", "QA"} else demand_family(
         project.get("Rol"), project.get("Dominio"))
     pool = [p for p in pool if role_compatible(role, p)]
     if not pool:
@@ -533,26 +501,14 @@ def diagnose_no_candidate(project, people, skill_columns, role_map):
     pool = [p for p in pool if seniority_fit(seniority, p["seniority"]) is not None]
     if not pool:
         return "No hay persona con seniority compatible"
-    required_type = project.get("_required_type", "")
     if role == "LT":
-        pool = [p for p in pool if p["resource_type"] == "interno"
-                and required_type == "interno"]
+        pool = [p for p in pool if p["resource_type"] == "interno"]
         if not pool:
             return "No hay LT interno elegible; LT no admite sustitución de tipo"
     else:
         pool = [p for p in pool if p["resource_type"] in {"interno", "externo"}]
         if not pool:
             return "No hay persona interna ni externa elegible"
-    required_domain = norm(project.get("Dominio"))
-    pool = [p for p in pool if required_domain and required_domain in (p.get("domains") or {
-        norm(value) for value in str(p.get("direction", "")).split("|") if norm(value)
-    })]
-    if not pool:
-        return "No hay persona con Dominio " + (project.get("Dominio") or "de la iniciativa")
-    if role == "LT":
-        pool = [p for p in pool if p["resource_type"] == "interno"]
-        if not pool:
-            return "No hay LT elegible que sea del banco"
     skill_failures = Counter()
     for person in pool:
         ok, _, reason = eligibility(project, person, skill_columns, role_map)
@@ -562,11 +518,11 @@ def diagnose_no_candidate(project, people, skill_columns, role_map):
         reason = skill_failures.most_common(1)[0][0]
         return {
             "sin skills obligatorias en la demanda": "La vacante no declara skills obligatorias",
-            "ninguna skill obligatoria registrada": "Ninguna persona tiene una skill obligatoria registrada",
+            "respaldo sin skills requiere Dominio coincidente": (
+                "No hay skills coincidentes ni una persona del Dominio para el respaldo"),
             "no liberado para el inicio del horizonte de asignación": (
                 "No hay persona liberada para el inicio del horizonte de asignación"),
-            "LT solo BBVA y sin sustitución de tipo": (
-                "No hay LT interno de BBVA elegible"),
+            "LT solo personal interno del banco": "No hay LT interno de BBVA elegible",
         }.get(reason, "No hay persona con skills coincidentes")
     return "No hay persona elegible"
 
@@ -602,13 +558,14 @@ def make_slots(projects):
 
 
 def project_key(project):
-    return (key(project.get("SDATOOL")), norm(project.get("Nombre Proyecto")),
+    return (norm(project.get("Dominio")), key(project.get("SDATOOL")), norm(project.get("Nombre Proyecto")),
             norm(project.get("Mesa")), project.get("Fecha Inicio", ""), project.get("Fecha Fin", ""))
 
 
 def mesa_group_key(project):
     """Clave interna de conteo; no se agrega como columna de salida."""
-    return (norm(project.get("Mesa")), norm(project.get("Foco estratégico (Fábrica)")))
+    return (norm(project.get("Dominio")), norm(project.get("Mesa")),
+            norm(project.get("Foco estratégico (Fábrica)")))
 
 
 def intervals_overlap(project_a, project_b):
@@ -631,8 +588,6 @@ def solve_slots(slots, people, role_map, viability_matrix=None, affinity_matrix=
         raise ValueError("La matriz V no coincide con las dimensiones de plazas y personas")
     if affinity_matrix is not None and affinity_matrix.shape != (len(slots), len(people)):
         raise ValueError("La matriz A no coincide con las dimensiones de plazas y personas")
-
-    prepare_skill_fallbacks(slots, people, role_map)
 
     pairs = []
     projects_by_key = {project_key(project): project for _, project in slots}
@@ -828,58 +783,97 @@ def solve_slots(slots, people, role_map, viability_matrix=None, affinity_matrix=
     phase2 = run(total_objective, [weighted_constraint])
     best_total = int(round(float(np.sum(phase2.x[:n_x]))))
     total_constraint = ({j: 1.0 for j in range(n_x)}, best_total, best_total)
-    no_skill_fallback_scores = np.array([
-        int(bool(slots[pair[0]][1].get("_allow_no_skill_fallback"))) for pair in pairs
-    ], dtype=float)
-    no_skill_fallback_constraint = []
-    if no_skill_fallback_scores.any():
-        fallback_objective = np.zeros(n_vars)
-        fallback_objective[:n_x] = -no_skill_fallback_scores
-        phase_fallback = run(fallback_objective, [weighted_constraint, total_constraint])
-        best_fallback = int(round(float(np.dot(no_skill_fallback_scores,
-                                                phase_fallback.x[:n_x]))))
-        no_skill_fallback_constraint = [
-            ({j: float(no_skill_fallback_scores[j]) for j in range(n_x)},
-             best_fallback, best_fallback)
-        ]
     mix_constraints = []
     if mesa_mixed_keys:
         mix_objective = np.zeros(n_vars)
         mix_objective[[mesa_mixed_index[mesa] for mesa in mesa_mixed_keys]] = -1
-        phase_mix = run(mix_objective, [weighted_constraint, total_constraint,
-                                        *no_skill_fallback_constraint])
+        phase_mix = run(mix_objective, [weighted_constraint, total_constraint])
         best_mixed_groups = int(round(sum(phase_mix.x[mesa_mixed_index[mesa]]
                                            for mesa in mesa_mixed_keys)))
         mix_constraints = [({mesa_mixed_index[mesa]: 1.0 for mesa in mesa_mixed_keys},
                             best_mixed_groups, best_mixed_groups)]
+    # Prioridad 1: conservar la SDA actual dentro de la lista de su Mesa+Foco.
+    continuity_scores = np.array([
+        affinity_components(slots[pair[0]][1], people[pair[1]])[0]
+        for pair in pairs
+    ], dtype=float)
+    continuity_objective = np.zeros(n_vars)
+    continuity_objective[:n_x] = -continuity_scores
+    phase_continuity = run(continuity_objective,
+                           [weighted_constraint, total_constraint, *mix_constraints])
+    best_continuity = int(round(float(np.dot(continuity_scores,
+                                             phase_continuity.x[:n_x]))))
+    continuity_constraint = ({j: float(continuity_scores[j]) for j in range(n_x)},
+                             best_continuity, best_continuity)
+
+    # Prioridad 1, segundo criterio: afinidad del Dominio.
+    domain_scores = np.array([
+        affinity_components(slots[pair[0]][1], people[pair[1]])[1]
+        for pair in pairs
+    ], dtype=float)
+    domain_objective = np.zeros(n_vars)
+    domain_objective[:n_x] = -domain_scores
+    phase_domain = run(domain_objective,
+                       [weighted_constraint, total_constraint, *mix_constraints,
+                        continuity_constraint])
+    best_domain = int(round(float(np.dot(domain_scores, phase_domain.x[:n_x]))))
+    domain_constraint = ({j: float(domain_scores[j]) for j in range(n_x)},
+                         best_domain, best_domain)
+
+    # Prioridad 2: rol es filtro estricto; aquí se ordena el seniority.
+    seniority_tiers = [seniority_fit(slots[pair[0]][1].get("Seniority"),
+                                     people[pair[1]]["seniority"]) for pair in pairs]
+    exact_scores = np.array([int(tier == 2) for tier in seniority_tiers], dtype=float)
+    above_scores = np.array([int(tier == 1) for tier in seniority_tiers], dtype=float)
+    exact_objective = np.zeros(n_vars); exact_objective[:n_x] = -exact_scores
+    priority_constraints = [weighted_constraint, total_constraint, *mix_constraints,
+                            continuity_constraint, domain_constraint]
+    phase4 = run(exact_objective, priority_constraints)
+    best_exact = int(round(float(np.dot(exact_scores, phase4.x[:n_x]))))
+    exact_constraint = ({j: float(exact_scores[j]) for j in range(n_x)}, best_exact, best_exact)
+    above_objective = np.zeros(n_vars); above_objective[:n_x] = -above_scores
+    phase5 = run(above_objective, [*priority_constraints, exact_constraint])
+    best_above = int(round(float(np.dot(above_scores, phase5.x[:n_x]))))
+    above_constraint = ({j: float(above_scores[j]) for j in range(n_x)}, best_above, best_above)
+
+    # Prioridad 3: maximizar primero vacantes con dos skills y después con una.
+    skill_counts = np.array([
+        skill_fit(slots[pair[0]][1], people[pair[1]], role_map)[0]
+        for pair in pairs
+    ], dtype=float)
+    two_skill_scores = np.array([int(count >= 2) for count in skill_counts], dtype=float)
+    two_skill_objective = np.zeros(n_vars)
+    two_skill_objective[:n_x] = -two_skill_scores
+    seniority_constraints = [*priority_constraints, exact_constraint, above_constraint]
+    phase_two_skills = run(two_skill_objective, seniority_constraints)
+    best_two_skills = int(round(float(np.dot(two_skill_scores,
+                                             phase_two_skills.x[:n_x]))))
+    two_skill_constraint = ({j: float(two_skill_scores[j]) for j in range(n_x)},
+                            best_two_skills, best_two_skills)
+    one_skill_scores = np.array([int(count >= 1) for count in skill_counts], dtype=float)
+    one_skill_objective = np.zeros(n_vars)
+    one_skill_objective[:n_x] = -one_skill_scores
+    phase_one_skill = run(one_skill_objective,
+                          [*seniority_constraints, two_skill_constraint])
+    best_one_skill = int(round(float(np.dot(one_skill_scores,
+                                            phase_one_skill.x[:n_x]))))
+    one_skill_constraint = ({j: float(one_skill_scores[j]) for j in range(n_x)},
+                            best_one_skill, best_one_skill)
+
+    # La categoría interna/externa es preferencia después de los tres criterios.
     requested_type_scores = np.array([
         int(people[pair[1]]["resource_type"] == slots[pair[0]][1].get("_required_type"))
         for pair in pairs
     ], dtype=float)
     requested_type_objective = np.zeros(n_vars)
     requested_type_objective[:n_x] = -requested_type_scores
-    phase_type = run(requested_type_objective,
-                     [weighted_constraint, total_constraint,
-                      *no_skill_fallback_constraint, *mix_constraints])
-    best_requested_type = int(round(float(np.dot(requested_type_scores, phase_type.x[:n_x]))))
+    final_constraints = [*seniority_constraints, two_skill_constraint,
+                         one_skill_constraint]
+    phase_type = run(requested_type_objective, final_constraints)
+    best_requested_type = int(round(float(np.dot(requested_type_scores,
+                                                  phase_type.x[:n_x]))))
     requested_type_constraint = ({j: float(requested_type_scores[j]) for j in range(n_x)},
                                  best_requested_type, best_requested_type)
-    seniority_tiers = [seniority_fit(slots[pair[0]][1].get("Seniority"),
-                                     people[pair[1]]["seniority"]) for pair in pairs]
-    exact_scores = np.array([int(tier == 2) for tier in seniority_tiers], dtype=float)
-    above_scores = np.array([int(tier == 1) for tier in seniority_tiers], dtype=float)
-    exact_objective = np.zeros(n_vars); exact_objective[:n_x] = -exact_scores
-    phase4 = run(exact_objective, [weighted_constraint, total_constraint,
-                                  *no_skill_fallback_constraint, *mix_constraints,
-                                  requested_type_constraint])
-    best_exact = int(round(float(np.dot(exact_scores, phase4.x[:n_x]))))
-    exact_constraint = ({j: float(exact_scores[j]) for j in range(n_x)}, best_exact, best_exact)
-    above_objective = np.zeros(n_vars); above_objective[:n_x] = -above_scores
-    phase5 = run(above_objective, [weighted_constraint, total_constraint,
-                                   *no_skill_fallback_constraint, *mix_constraints,
-                                   requested_type_constraint, exact_constraint])
-    best_above = int(round(float(np.dot(above_scores, phase5.x[:n_x]))))
-    above_constraint = ({j: float(above_scores[j]) for j in range(n_x)}, best_above, best_above)
     if affinity_matrix is not None:
         final_affinity_scores = np.array([
             affinity_matrix[pair[0], pair[1]] for pair in pairs
@@ -891,10 +885,7 @@ def solve_slots(slots, people, role_map, viability_matrix=None, affinity_matrix=
         ], dtype=float)
     affinity_objective = np.zeros(n_vars)
     affinity_objective[:n_x] = -final_affinity_scores
-    final = run(affinity_objective, [weighted_constraint, total_constraint,
-                                     *no_skill_fallback_constraint, *mix_constraints,
-                                     requested_type_constraint,
-                                     exact_constraint, above_constraint])
+    final = run(affinity_objective, [*final_constraints, requested_type_constraint])
 
     selected = [(pairs[j][0], pairs[j][1], pairs[j][2])
                 for j, value in enumerate(final.x[:n_x]) if value > 0.5]
@@ -906,7 +897,18 @@ def solve(projects, people, skill_columns, role_map):
     return solve_slots(slots, people, role_map)
 
 
-def recommend_candidates(slots, selected, people, role_map, limit=5, only_unfilled=False):
+def recommendation_priority(project, person, role_map=None):
+    """Ordena opciones con la misma jerarquía de SDA, Dominio, seniority y skills."""
+    continuity, domain_match = affinity_components(project, person)
+    seniority = seniority_fit(project.get("Seniority"), person["seniority"])
+    skill_count = skill_fit(project, person, role_map)[0]
+    exact_type = int(person["resource_type"] == project.get("_required_type"))
+    return (continuity, domain_match, seniority, int(skill_count >= 2),
+            int(skill_count >= 1), skill_count, exact_type)
+
+
+def recommend_candidates(slots, selected, people, role_map,
+                         limit=MAX_SUGGESTED_PER_MESA, only_unfilled=False):
     assigned_by_mesa = defaultdict(set)
     assigned_slots = set()
     for slot_index, person_index, _score in selected:
@@ -920,19 +922,22 @@ def recommend_candidates(slots, selected, people, role_map, limit=5, only_unfill
         mesa = mesa_group_key(project)
         family = role_map.get(norm(project.get("Rol")), demand_family(
             project.get("Rol"), project.get("Dominio")))
-        if family not in {"DEV", "DEV_INT", "DEV_EXT", "QA"}:
+        if family not in {"DEV", "QA"}:
             continue
         for index, person in enumerate(people):
             ok, _, _ = eligibility(project, person, set(), role_map)
             # Una sugerencia es opcional: puede estar comprometida en otra
             # iniciativa. La capacidad solo se exige si se promueve a asignación.
             if ok and index not in assigned_by_mesa[mesa]:
-                candidates_by_mesa[mesa][index] = max(
-                    candidates_by_mesa[mesa].get(index, 0), affinity_score(project, person, role_map))
+                priority = recommendation_priority(project, person, role_map)
+                if priority > candidates_by_mesa[mesa].get(index, ()):
+                    candidates_by_mesa[mesa][index] = priority
     result = {}
     for mesa, ranked in candidates_by_mesa.items():
         result[mesa] = [person for person, _ in sorted(
-            ranked.items(), key=lambda item: (-item[1], people[item[0]]["name"], people[item[0]]["code"]))[:limit]]
+            ranked.items(), key=lambda item: (
+                tuple(-value for value in item[1]),
+                people[item[0]]["name"], people[item[0]]["code"]))[:limit]]
     return result
 
 
@@ -1007,9 +1012,9 @@ def main():
             "Ajuste tipo de recurso": (
                 "Exacto" if person["resource_type"] == project.get("_required_type")
                 else f"Sustitución: {person['resource_type']} cubre plaza {project.get('_required_type')}"),
-            "FTE asignado": 1.0, "Afinidad SDA/Mesa actual": continuity,
+            "FTE asignado": 1.0, "Afinidad SDA del grupo Mesa+Foco": continuity,
             "Afinidad Dominio": domain, "Puntaje preferencias": score,
-            "Ajuste coincidencia sin skills": -skill_match_penalty(project, person, role_map),
+            "Penalización por skills": -skill_match_penalty(project, person, role_map),
             "Puntaje skills obligatorias": skill_fit(project, person, role_map)[0],
             "Comentario skills obligatorias": skill_observation(project, person, role_map),
             **current_staffing_fields(person, project),
@@ -1041,7 +1046,7 @@ def main():
               and assigned_types_by_mesa[mesa_group_key(project)] != {"interno", "externo"}):
             reason = "Mesa sin asignar: no fue posible asegurar presencia interna y externa"
         elif len(people_by_mesa[mesa_group_key(project)]) >= MAX_BASE_ASSIGNMENTS_PER_GROUP + MAX_SUGGESTED_PER_MESA:
-            reason = "El grupo alcanzó 7 asignaciones base más 5 sugeridas"
+            reason = "El grupo alcanzó 7 asignaciones base más 3 sugeridas"
         elif (len(people_by_mesa[mesa_group_key(project)]) >= MAX_BASE_ASSIGNMENTS_PER_GROUP
               and not (set(recommendation_pool.get(mesa_group_key(project), []))
                        - people_by_mesa[mesa_group_key(project)])):

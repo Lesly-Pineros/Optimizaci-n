@@ -1,69 +1,41 @@
-# Reglas del modelo MILP de asignación
+# Reglas aplicadas en limpieza y asignación
 
-## 1. Población y disponibilidad
+La especificación completa y el orden de ejecución están en
+`MODELOS_ASIGNACION.md`.
 
-1. **Pool base:** se parte de los profesionales de la Matriz de SkillsCOE. Un registro con rol nulo o basura, o sin Dominio asignado, queda excluido del pool elegible y se reporta con su motivo.
-2. **Recursos en backlog:** una persona de SkillsCOE sin registro en Staffing Q4 se clasifica como `BACKLOG`. Puede ser candidata desde el inicio del horizonte si tiene rol válido, Dominio y tipo de recurso disponibles en la fuente; el modelo no inventa datos faltantes. Si no tiene Dominio asignado, queda excluida.
-3. **Capacidad teórica:** todo el personal elegible se considera con capacidad teórica del **100% (1.0 FTE)**, sin excluirlo por su `Fecha Fin Actual` en Staffing Q4. Las asignaciones actuales se muestran en un comentario con proyecto/Mesa y rango de trimestres.
-4. **Proyectos simultáneos:** se permite un máximo de dos proyectos/Mesas simultáneos contando las asignaciones vigentes de Staffing Q4 y las nuevas asignaciones del modelo. Si la persona ya tiene un proyecto vigente, puede recibir uno adicional; no puede superar dos durante ningún intervalo. Las plazas nuevas son indivisibles de 1.0 FTE.
-5. **Horizonte:** la simultaneidad se valida por período/intervalo de fechas dentro del horizonte planificado. La fecha de liberación de Staffing ya no es un filtro de elegibilidad.
-
-## 2. Plazas, familias de rol y filtros técnicos
-
-6. **Demanda FTE:** cada unidad indicada en `Internal` o `External` representa una necesidad indivisible de 1.0 FTE. Cada plaza conserva Mesa, fechas, rol, seniority, tipo y skills obligatorias. La versión actual no divide una plaza entre varios profesionales.
-7. **Filtro de iniciativas:** se recorren todas las filas de `GRM-iniciativas.csv` después del encabezado. Todas se consideran iniciativas GRM, aunque la columna fuente `Dominio` tenga otro valor o esté vacía; ese valor se conserva en `Dominio fuente` y el dominio de modelado se normaliza a `GRM`. Para entrar en demanda, cada fila requiere rol reconocido y seniority homologado, además de una skill obligatoria; las plazas QA sin ninguna skill obligatoria ni sugerida también se conservan.
-   - Mapeo de roles de demanda GRM: `LT` → `LT`; `QA` → `QA`; `Dev Int` → `DEV_INT`; `Dev Ext` → `DEV_EXT`. Las familias `DEV_INT` y `DEV_EXT` se mantienen separadas. `Dev Int` requiere profesional interno; `Dev Ext` prefiere externo y admite interno como respaldo. El mapeo de personas permanece en `mapeo_roles.py`.
-8. **Familias de rol de personas (mapeo provisional BD2):** se aplica el catálogo `person_role_families` de `mapeo_roles.py`:
-   - Desarrollador, Analista Técnico, Arquitecto y Funcional: `DEV`, `QA`.
-   - QA/Testing: `QA`.
-   - Service Reliability Lead, Tech Manager/Líder, Líder y Líder de Servicio: `LT`, `DEV`, `QA`.
-   - Data Service, Infraestructura, Despliegues, Operativa y Otros: `DEV`, `QA`.
-   - Rol nulo, `NA...` o `cod eliminado`: ninguna familia; se excluye del pool.
-   - Los roles válidos que no aparecen en estas categorías se tratan provisionalmente como Otros (`DEV`, `QA`); cualquier rol nuevo debe revisarse en el catálogo.
-   - La matriz SkillsCOE registra perfiles con seniority `Lead` en `Desarrollador`, `Arquitecto`, `Despliegues`, `Otros`, `SOFTWARE EXPERT` y `tech`. Esos perfiles suman `LT` a sus familias habituales solo cuando el seniority individual es `Lead`. Testing/QA permanece exclusivamente en `QA`; todas las plazas LT siguen requiriendo personal interno.
-9. **Rol y seniority:** después de normalizar al catálogo acordado, el candidato debe ser elegible para la familia solicitada. Se admite seniority exacto, un nivel por encima o, como último recurso, un nivel por debajo. La prioridad del modelo es exacto > superior > inferior; solo usa una categoría adyacente en la escala `Junior < Mid-Level < Senior < Lead`. Un seniority vacío/no homologado o con diferencia mayor a un nivel no pasa el filtro. La prioridad de seniority se aplica después de maximizar la cobertura y antes de continuidad y afinidad.
-10. **Filtro y puntaje técnico:** para cada vacante se cuentan únicamente las skills técnicas y funcionales marcadas como obligatorias. El candidato debe tener al menos **una** de esas skills registrada, sin filtrar por su nivel. Cada skill obligatoria registrada suma un punto; tener niveles más altos no da puntos adicionales. Las skills sugeridas no cuentan como match. Si una demanda tiene skills pero ningún candidato elegible cubre al menos una, se activa respaldo por rol y seniority; las demandas QA sin ninguna skill obligatoria ni sugerida diligenciada también usan este respaldo. Entre soluciones con cobertura óptima, las plazas con respaldo se priorizan y cada asignación sin match muestra -10 puntos en el puntaje reportado; este ajuste no forma parte de la función objetivo. Si otro rol no declara skills obligatorias, la vacante se reporta para corregir.
-11. **Tipo de recurso y sustitución:** `Dev Int` requiere personas internas. `Dev Ext` y los demás roles no LT prefieren el tipo solicitado, pero admiten el tipo opuesto como respaldo si no hay una persona elegible del tipo requerido. `LT` solo puede cubrirse con personal interno y no admite sustitución. Una marca de tipo desconocido no se convierte automáticamente en interna o externa.
-12. **Dominio GRM:** toda persona asignada a estas iniciativas debe tener `GRM` entre sus dominios. Es un filtro duro, no una preferencia. La salida muestra el dominio de la persona asignada.
-13. **Líder Técnico:** toda vacante `LT` solo puede asignarse a personal interno del banco y debe cumplir el seniority admitido. Aplica la misma regla de skills: al menos una skill obligatoria registrada, sin filtrar por nivel. Si el match está en Básico, la salida lo indica en `Comentario skills obligatorias`.
-
-## 3. Cobertura y límites por Mesa
-
-14. **Mezcla interna/externa:** se prioriza que cada grupo `Mesa` + `Foco estratégico (Fábrica)` incluya personas internas y externas, siempre que sea posible con la cobertura máxima. Si no hay una combinación viable de ambos tipos, se asigna el tipo disponible y se informa la mezcla incompleta. La recomendación de candidatos no cuenta como asignación.
-15. **Clave de conteo de mesa:** para contar equipos se usa internamente la pareja `Mesa` + `Foco estratégico (Fábrica)`. Esta unión solo identifica el grupo; no se agrega como columna ni modifica los valores de origen en la entrega.
-16. **Límite base y ampliación:** cada grupo tiene hasta **7 asignaciones base** y puede incorporar hasta **5 personas adicionales** de la lista de sugerencias cuando hay plazas restantes. Si la mesa solicita más de siete roles, el modelo debe probar y asignar candidatos sugeridos que cubran esas vacantes; no debe dejar plazas vacantes solo por alcanzar siete asignaciones base. El máximo es 12 personas por grupo.
-17. **Candidatos sugeridos opcionales:** el modelo muestra hasta **5 candidatos** por grupo, enfocados en `DEV` y `QA`, aunque estén comprometidos con otra iniciativa. La salida los etiqueta como opcionales e indica su asignación To-Be actual cuando la tengan. Una recomendación no asignada no cuenta como cobertura ni para la mezcla interna/externa. Al promoverla se valida el máximo de dos proyectos simultáneos, contando Staffing Q4.
-18. **Prioridad de grupos:** todos los grupos `Mesa` + `Foco estratégico (Fábrica)` tienen igual prioridad. La función objetivo no favorece un grupo por tener más plazas; compara cobertura proporcional por grupo antes de afinar preferencias individuales.
-
-## 4. Objetivo del MILP
-
-19. **Orden lexicográfico recomendado:** resolver en etapas para evitar que una preferencia blanda compense una restricción dura:
-   1. Maximizar la cobertura factible respetando capacidad, número máximo de proyectos simultáneos, límite por grupo Mesa+Foco y presencia interna/externa.
-   2. Con cobertura proporcional y total fijados, maximizar las plazas QA que no tienen ninguna skill diligenciada.
-   3. Con la cobertura máxima fijada, priorizar la presencia de internos y externos en cada grupo Mesa+Foco cuando sea viable.
-   4. Maximizar asignaciones del tipo solicitado; usar el tipo opuesto como respaldo cuando no haya una combinación factible con el tipo requerido, salvo LT, que debe ser interno.
-   5. Entre soluciones restantes, priorizar seniority exacto, después superior y finalmente inferior.
-   6. Favorecer continuidad: para SDA se compara el valor de `SDATOOL - Proyecto` de `Matriz SkillsCOE enriquecida.csv` (tomado del registro de mayor dedicación cuando hay varios) contra `SDATOOL` de `GRM-iniciativas con skills.csv`. Coinciden por texto o por identificador numérico completo aunque las letras sean distintas; no se comparan dígitos parciales. La Mesa actual se compara por separado con la columna `Mesa`.
-   7. Después priorizar afinidad de Dominio y cantidad de skills obligatorias registradas.
-20. **Puntaje de skills:** cada skill obligatoria registrada suma un punto de preferencia, sin importar su nivel. Las skills sugeridas no suman puntos. Una asignación por respaldo sin match muestra un ajuste informativo de -10 puntos, sin modificar la selección del MILP.
-21. **No asignados:** una plaza que no pueda cubrirse con candidatos elegibles queda vacante y se reporta con la causa principal (rol/familia, seniority, skills, tipo, Dominio, capacidad, simultaneidad o composición de Mesa+Foco).
-
-## 5. Traducción a restricciones del MILP
-
-- `x[p,s] ∈ {0,1}` = asignar a la persona `p` a la plaza completa `s`.
-- Cada plaza recibe como máximo una persona; cada persona cubre como máximo una plaza por proyecto.
-- Una persona puede cubrir plazas en hasta dos proyectos simultáneos. Las variables de actividad por persona/proyecto aplican este máximo; la asignación a dos proyectos solapados está permitida.
-- Por grupo `Mesa` + `Foco estratégico (Fábrica)`, máximo siete personas únicas en la base. Tras maximizar cobertura, se favorece que estén presentes ambos tipos; si no es viable, se permite asignar el tipo disponible y se informa la mezcla incompleta.
-- El tipo solicitado se prioriza. `Dev Int` requiere interno; `Dev Ext` y los demás roles distintos de LT admiten el tipo opuesto como respaldo. LT debe ser interno.
-- El objetivo prioriza cobertura proporcional por grupo `Mesa` + `Foco estratégico (Fábrica)` (prioridad igual), ajuste de seniority (exacto > superior > inferior), continuidad en la SDA/Mesa actual, afinidad de Dominio y cantidad de skills obligatorias cubiertas.
-- Los filtros de rol, seniority adyacente como máximo, skills según la regla de respaldo, tipo y Dominio asignado se aplican antes del objetivo. Las asignaciones actuales de Staffing cuentan para el límite de simultaneidad, no como fecha de liberación.
-
-## 6. Datos y decisiones que deben quedar explícitos para implementar
-
-- Si se requiere asignación parcial de FTE para que una persona cubra simultáneamente dos proyectos; la versión actual trata cada plaza como indivisible de 1 FTE.
-- Identificador y fechas de inicio/fin de cada proyecto, incluidas las asignaciones vigentes de Staffing Q4, para determinar simultaneidad en cada intervalo.
-- Catálogo controlado que clasifica cada Rol Principal como LT, Testing, DEV/QA u otra familia; reglas para detectar valores basura.
-- Correspondencia entre Dominio del profesional y Dominio requerido por cada Mesa, incluida la dirección de afinidad cuando no coinciden.
-- Historial de SDA/Mesa actual y porcentaje de dedicación por persona; si hay más de una asignación actual, escoger la de mayor dedicación para continuidad.
-- Pesos o prioridad lexicográfica entre continuidad, afinidad de Dominio y afinidad de Mesa actual. Las reglas indican preferencia, pero no fijan pesos numéricos.
-- Texto recibido incompleto: “Los profesionales en la Matriz de Skills que no fig…”. Se interpreta únicamente la regla completa de recursos sin registro en Staffing Q4 indicada en el punto 2; cualquier condición adicional de la frase cortada requiere el texto completo.
+1. **Población:** SkillsCOE es la base. Se enriquece con Staffing Q4. Personas
+   que no aparecen en Staffing se marcan `BACKLOG`; sin Dominio o sin tipo
+   interno/externo válido no entran al pool. Roles vacíos, con `NA` al inicio o
+   fuera del catálogo se excluyen y se reportan.
+2. **Fuente de rol:** solo se usa SkillsCOE, columna E, `Rol Principal`.
+   Desarrollador, Arquitecto y Despliegues → DEV; QA → QA; Tech Manager/Líder,
+   Service Reliability Lead, Líder Primera Línea y PTL → LT. Personas e
+   iniciativas se normalizan a los mismos tres valores. No se infiere LT por
+   seniority.
+3. **Dominios:** ENG y GRM se asignan juntos, con capacidad compartida. Otros
+   dominios se pueden incorporar en `ASSIGNMENT_DOMAINS`.
+   La limpieza conserva cada fila de vacante, pero escribe en `SDATOOL` la lista
+   deduplicada de todas las SDA del grupo Mesa + Foco estratégico.
+4. **Capacidad:** cada plaza equivale a 1 FTE y cada persona puede estar en un
+   máximo de dos proyectos simultáneos, contando Staffing Q4. Se usa una
+   capacidad teórica del 100%; la dedicación actual solo resuelve continuidad.
+5. **Prioridad, después de maximizar cobertura:** (1) continuidad SDA incluida
+   en la lista del grupo y coincidencia de Dominio; el modelo maximiza primero
+   SDA y luego Dominio; (2) rol como filtro estricto y seniority exacto,
+   superior y luego inferior; (3) skills: dos o más coincidencias, luego una y
+   por último ninguna. Para varias asignaciones Staffing, continuidad usa la
+   SDA de mayor dedicación.
+6. **Skills:** cualquier nivel positivo cuenta. Una coincidencia en una demanda
+   de dos o más skills recibe penalización de 5; ninguna, 10. El respaldo sin
+   skills exige coincidencia de Dominio. QA puede no declarar skills y entra
+   por su rol y seniority, con penalización de 10. No se aplica un umbral de
+   nivel de skill según seniority.
+7. **Seniority:** se permite una categoría adyacente como máximo. No se
+   transforma el seniority en umbral de skill.
+8. **LT y mezcla:** LT solo se asigna a personal interno del banco. Se maximiza
+   la presencia interna y externa por mesa cuando ambos tipos están disponibles.
+9. **Límite por mesa:** máximo siete asignaciones base y tres recomendaciones
+   DEV/QA. Todos los grupos Mesa+Dominio tienen la misma prioridad proporcional
+   de cobertura.
+10. **Campos no usados como requisito:** no se modifican `Nivel general skills
+    técnicos` ni `Nivel IA`; las skills sugeridas tampoco cuentan como match.

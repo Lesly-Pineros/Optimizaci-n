@@ -65,7 +65,7 @@ def write_xlsx_sheets(path, sheets):
 
 def export_tobe(path, source_header, projects, slots, selected, people, skill_fit, skill_fields,
                 role_map=None, recommendation_pool=None):
-    """Entrega una sola hoja: datos A:R, asignación y recomendaciones al final."""
+    """Exporta asignaciones y candidatos opcionales en pestañas separadas."""
     from collections import defaultdict
     import asignacion_milp as base
     role_map = role_map or {}
@@ -76,7 +76,7 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
         "Dominio requerido", "Fila origen", "N.º plaza", "Tipo requerido", "Estado asignación",
         "Motivo sin asignar", "Persona asignada", "Código persona", "Origen de asignación", "Rol persona",
         "Seniority persona", "Ajuste seniority", "Tipo persona", "Ajuste tipo de recurso", "Dominio persona",
-        "Puntaje preferencias", "Ajuste coincidencia sin skills",
+        "Puntaje preferencias", "Penalización por skills",
         "Porcentaje coincidencia skills obligatorias",
         "Puntaje skills obligatorias",
         "Comentario skills obligatorias",
@@ -85,7 +85,6 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
         "SDATOOL - Proyecto Staffing actual",
         "Fecha Inicio Staffing actual", "Fecha Fin Actual Staffing", 
         "% Dedicación Staffing actual",
-        "Candidatos adicionales sugeridos DEV/QA",
     ]
     assignment_headers = source_fields + extra_fields
 
@@ -178,7 +177,7 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
                       if person else "")),
             "Dominio persona": " | ".join(sorted(person.get("domains", set()))) if person else "",
             "Puntaje preferencias": score if person else "",
-            "Ajuste coincidencia sin skills": (
+            "Penalización por skills": (
                 -base.skill_match_penalty(project, person, role_map) if person else ""),
             "Porcentaje coincidencia skills obligatorias": percent,
             "Puntaje skills obligatorias": skill_score,
@@ -213,22 +212,68 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
         project = slots[slot][1]
         commitments_by_person[person_index].append(
             f"{project.get('Mesa', '')} / {project.get('Nombre Proyecto', '')}")
-    seen_mesas = set()
-    for row in assignment_rows:
-        mesa = base.mesa_group_key(row)
-        if mesa in seen_mesas:
-            row["Candidatos adicionales sugeridos DEV/QA"] = ""
-            continue
-        seen_mesas.add(mesa)
-        names = []
-        for index in recommendations.get(mesa, []):
-            person = people[index]
-            commitments = commitments_by_person.get(index, [])
-            availability = ("Opcional; comprometido en To-Be: " + "; ".join(commitments)
-                            if commitments else
-                            f"Opcional; sin asignación To-Be ({person.get('staffing_status', 'disponible')})")
-            names.append(f"{person['name']} [{person['code']}] — "
-                         f"{person['role_raw']}, {person['seniority_raw']}, "
-                         f"{person['resource_type']}; {availability}")
-        row["Candidatos adicionales sugeridos DEV/QA"] = "\n".join(names)
-    write_xlsx(path, assignment_headers, assignment_rows, sheet_name="Asignaciones")
+    option_headers = [
+        "equipo", "codigo", "nombre", "direccion", "seniority", "tipo_recurso",
+        "familia_sugerida", "dominio", "skills_requeridas", "skills", "skills_faltantes",
+        "coincidencia", "seniority_solicitado", "compromiso_to_be",
+    ]
+    option_rows = []
+    for mesa in sorted(recommendations):
+        for person_index in recommendations[mesa]:
+            person = people[person_index]
+            matching_projects = []
+            for _, project in slots:
+                family = base.demand_family(project.get("Rol"), project.get("Dominio"))
+                if base.mesa_group_key(project) != mesa or family not in {"DEV", "QA"}:
+                    continue
+                if base.eligibility(project, person, set(), role_map)[0]:
+                    matching_projects.append(project)
+            if not matching_projects:
+                continue
+            project = max(
+                matching_projects,
+                key=lambda item: base.recommendation_priority(item, person, role_map),
+            )
+            _percent, _ratio, matched, missing, matched_count, _note = skill_report(project, person)
+            required_names = []
+            seen_skills = set()
+            for field in base.TECH_FIELDS + base.FUNCTIONAL_FIELDS:
+                name = (project.get(field) or "").strip()
+                skill_key = base.norm(name)
+                if name and skill_key not in seen_skills:
+                    required_names.append(name)
+                    seen_skills.add(skill_key)
+            # Un requerimiento QA sin skills no tiene denominador para calcular
+            # coincidencia; se indica N/A en vez de presentar cero falsamente.
+            skill_count = len(required_names)
+            coincidence = (round(matched_count / skill_count, 1) if skill_count else "N/A")
+            team = " | ".join(str(project.get(field) or "").strip() for field in
+                              ("Mesa", "Dirección", "Foco estratégico (Fábrica)")
+                              if str(project.get(field) or "").strip())
+            commitments = commitments_by_person.get(person_index, [])
+            option_rows.append({
+                "equipo": team,
+                "codigo": person["code"],
+                "nombre": person["name"],
+                "direccion": person.get("staffing_direction", ""),
+                "seniority": person["seniority_raw"],
+                "tipo_recurso": person["resource_type"],
+                "familia_sugerida": base.demand_family(project.get("Rol"), project.get("Dominio")),
+                "dominio": project.get("Dominio", ""),
+                "skills_requeridas": "; ".join(required_names),
+                "skills": matched,
+                "skills_faltantes": missing,
+                "coincidencia": coincidence,
+                "seniority_solicitado": project.get("Seniority", ""),
+                "compromiso_to_be": " | ".join(commitments) if commitments else "Sin asignación To-Be",
+            })
+
+    option_rows.sort(key=lambda row: (
+        base.norm(row["equipo"]), base.norm(row["familia_sugerida"]),
+        -float(row["coincidencia"]) if isinstance(row["coincidencia"], (int, float)) else 0,
+        base.norm(row["nombre"]), row["codigo"],
+    ))
+    write_xlsx_sheets(path, [
+        ("Asignaciones", assignment_headers, assignment_rows),
+        ("Opciones", option_headers, option_rows),
+    ])
