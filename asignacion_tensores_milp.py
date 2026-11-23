@@ -8,9 +8,9 @@ from salidas_asignacion import export_tobe
 ROOT = Path(__file__).resolve().parent
 INPUTS = ROOT / "RESULTADOS_LIMPIEZA"
 RESULTS = ROOT / "RESULTADOS MODELOS"
-EXCEL_FILE = RESULTS / "Asignacion_To-Be_Tensores_Lexicografico.xlsx"
-V_FILE = RESULTS / "Viabilidad_V.csv"
-A_FILE = RESULTS / "Afinidad_A.csv"
+EXCEL_FILE = RESULTS / "Asignacion GRM To-Be_Tensores_Lexicografico.xlsx"
+V_FILE = RESULTS / "Viabilidad_V_GRM.csv"
+A_FILE = RESULTS / "Afinidad_A_GRM.csv"
 
 
 def make_slots(projects):
@@ -25,6 +25,7 @@ def affinity(project, person, number_of_slots, role_map=None):
 def solve_lexicographic(slots, people, role_map, return_recommendations=False):
     import numpy as np
 
+    base.prepare_skill_fallbacks(slots, people, role_map)
     ns, npeople = len(slots), len(people)
     V = np.zeros((ns, npeople), dtype=np.uint8)
     A = np.zeros((ns, npeople), dtype=np.float32)

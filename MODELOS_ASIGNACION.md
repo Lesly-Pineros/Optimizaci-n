@@ -9,20 +9,20 @@ python3 asignacion_tensores_milp.py
 ```
 
 `limpieza.py` primero ejecuta la extracción de Staffing Q4 desde `DATA/STAFFING.xlsx`,
-cruza códigos con SkillsCOE y prepara la demanda. Ambos modelos leen los CSV de
+cruza códigos con SkillsCOE y prepara la demanda GRM. Ambos modelos leen los CSV de
 `RESULTADOS_LIMPIEZA/` y escriben sus resultados en `RESULTADOS MODELOS/`.
 La limpieza conserva solo iniciativas con rol reconocido en `mapeo_roles.py`,
 seniority homologado y al menos una skill técnica/funcional obligatoria.
-Recorre todas las filas de datos de la matriz, no un rango fijo; las direcciones
-organizacionales observadas se normalizan al dominio `ENG` porque este archivo es
-la matriz de iniciativas ENG.
+Recorre todas las filas de datos de la matriz. Todas se tratan como iniciativas
+GRM independientemente del valor fuente en `Dominio`; ese valor se conserva en
+`Dominio fuente` para auditoría.
 
 ## Reglas que comparten ambos modelos
 
 `RESULTADOS_LIMPIEZA/Reglas.md` es la referencia operativa. Los dos modelos usan
 la misma matriz de viabilidad y las mismas restricciones duras:
 
-- Solo se asignan roles válidos, tipo requerido y personas con Dominio `ENG`.
+- Solo se asignan roles válidos, tipo requerido y personas con Dominio `GRM`.
   Las iniciativas también deben tener rol mapeado, seniority válido y al menos
   una skill obligatoria para entrar en la demanda.
   El seniority puede ser exacto, un nivel superior o, como último recurso, un
@@ -37,17 +37,24 @@ la misma matriz de viabilidad y las mismas restricciones duras:
   Para todos los roles basta una skill obligatoria registrada; el nivel no
   filtra. Si un match de LT está en Básico, la salida lo señala en el comentario
   de skills.
-- Se prioriza el tipo solicitado (`Internal`/`External`). En roles distintos de
-  LT, el tipo opuesto puede cubrir una plaza cuando no haya candidatos elegibles
-  del tipo requerido; la salida marca la sustitución. LT sigue siendo interno y
-  no admite este respaldo.
+- En GRM, `Dev Int` requiere personal interno y `Dev Ext` prefiere personal
+  externo, con personal interno como respaldo. El catálogo mantiene ambas
+  familias de demanda separadas. `LT` requiere personal interno. En los demás
+  roles se conserva la regla de respaldo del tipo opuesto.
 - El candidato debe tener al menos una skill técnica/funcional obligatoria
-  registrada, sin importar el nivel. Entre candidatos con la misma continuidad
-  y afinidad de Dominio, registrar más skills obligatorias aumenta el puntaje;
-  el nivel no cambia el puntaje.
-- La fecha de liberación se calcula con Staffing Q4. Se permiten hasta dos
-  proyectos simultáneos por persona; una asignación solapada no se bloquea
-  automáticamente. Cada plaza sigue siendo indivisible de 1.0 FTE.
+  registrada, sin importar el nivel. Si una plaza tiene skills pero no existe
+  ningún candidato elegible con match, se permite el respaldo por rol y seniority.
+  Las plazas QA sin ninguna skill diligenciada tienen esta regla directamente.
+  Entre soluciones con cobertura óptima se priorizan las plazas con respaldo;
+  cada asignación sin match muestra un ajuste de -10 en `Puntaje preferencias`.
+  Ese ajuste es informativo y no entra en la función objetivo. Entre candidatos
+  con la misma continuidad y afinidad de Dominio,
+  registrar más skills obligatorias aumenta el puntaje; el nivel no cambia el
+  puntaje.
+- Todo el personal elegible conserva capacidad teórica del 100%. Las asignaciones
+  vigentes de Staffing Q4 se muestran con proyecto/Mesa y rango de trimestres, y
+  cuentan para el máximo de dos proyectos simultáneos. Cada plaza sigue siendo
+  indivisible de 1.0 FTE.
 - Cada grupo identificado por `Mesa` + `Foco estratégico (Fábrica)` tiene hasta
   siete asignaciones base más cinco personas sugeridas adicionales. Si quedan
   roles por cubrir, el modelo puede promover sugerencias elegibles si están
@@ -88,22 +95,23 @@ cinco recomendaciones DEV/QA por grupo Mesa+Foco van en la última columna y se
 muestran una vez por grupo, aunque las personas estén comprometidas en otra
 iniciativa. La lista indica su asignación To-Be actual. Cuando una recomendación
 cubre una vacante se incluye como asignación y se identifica como `Candidato
-sugerido adicional`; su disponibilidad se vuelve a validar en el MILP.
+sugerido adicional`; el límite de dos proyectos simultáneos, contando Staffing,
+se valida en el MILP.
 
 El CSV enriquecido conserva `SDATOOL - Proyecto`, `Fecha Inicio`, `Fecha Fin
-Actual`, Mesa y dedicación. También guarda las asignaciones Q4 estructuradas para
-mantener SDA, fechas y dedicación emparejadas cuando una persona tiene más de un
-registro. La entrega muestra los campos del registro de mayor dedicación para cada
-persona asignada. Las recomendaciones que no se promueven no forman parte de la
-asignación ni consumen capacidad. Las promovidas ocupan la plaza y deben respetar
-los filtros de elegibilidad y capacidad.
+Actual`, Mesa y dedicación. También muestra un comentario con las asignaciones
+Staffing que se traslapan con cada plaza y su rango de trimestres. Guarda las
+asignaciones Q4 estructuradas para mantener SDA, fechas y dedicación emparejadas
+cuando una persona tiene más de un registro. Las recomendaciones que no se
+promueven no forman parte de la asignación ni consumen capacidad. Las promovidas
+ocupan la plaza y deben respetar los filtros de elegibilidad y capacidad.
 
 ## Archivos generados
 
-- `RESULTADOS MODELOS/Asignacion_To-Be_Baseline.xlsx`
-- `RESULTADOS MODELOS/Asignacion_To-Be_Tensores_Lexicografico.xlsx`
-- `RESULTADOS MODELOS/Asignaciones MILP.csv`
-- `RESULTADOS MODELOS/Plazas sin asignar MILP.csv`
-- `RESULTADOS MODELOS/Similitud de roles.csv` (ahora contiene el mapeo a familia)
-- `RESULTADOS MODELOS/Viabilidad_V.csv` (1 = par elegible)
-- `RESULTADOS MODELOS/Afinidad_A.csv` (afinidad por continuidad y Dominio)
+- `RESULTADOS MODELOS/Asignacion GRM To-Be_Baseline.xlsx`
+- `RESULTADOS MODELOS/Asignacion GRM To-Be_Tensores_Lexicografico.xlsx`
+- `RESULTADOS MODELOS/Asignaciones GRM MILP.csv`
+- `RESULTADOS MODELOS/Plazas GRM sin asignar MILP.csv`
+- `RESULTADOS MODELOS/Similitud de roles GRM.csv` (mapeo de roles a familia)
+- `RESULTADOS MODELOS/Viabilidad_V_GRM.csv` (1 = par elegible)
+- `RESULTADOS MODELOS/Afinidad_A_GRM.csv` (afinidad por continuidad y Dominio)

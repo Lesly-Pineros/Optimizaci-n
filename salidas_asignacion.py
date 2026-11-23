@@ -76,10 +76,12 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
         "Dominio requerido", "Fila origen", "N.º plaza", "Tipo requerido", "Estado asignación",
         "Motivo sin asignar", "Persona asignada", "Código persona", "Origen de asignación", "Rol persona",
         "Seniority persona", "Ajuste seniority", "Tipo persona", "Ajuste tipo de recurso", "Dominio persona",
+        "Puntaje preferencias", "Ajuste coincidencia sin skills",
         "Porcentaje coincidencia skills obligatorias",
         "Puntaje skills obligatorias",
         "Comentario skills obligatorias",
         "Skills obligatorias coincidentes", "Skills con match", "Skills faltantes",
+        "Comentario asignación Staffing",
         "SDATOOL - Proyecto Staffing actual",
         "Fecha Inicio Staffing actual", "Fecha Fin Actual Staffing", 
         "% Dedicación Staffing actual",
@@ -175,14 +177,18 @@ def export_tobe(path, source_header, projects, slots, selected, people, skill_fi
                 else (f"Sustitución: {person['resource_type']} cubre plaza {project.get('_required_type')}"
                       if person else "")),
             "Dominio persona": " | ".join(sorted(person.get("domains", set()))) if person else "",
+            "Puntaje preferencias": score if person else "",
+            "Ajuste coincidencia sin skills": (
+                -base.skill_match_penalty(project, person, role_map) if person else ""),
             "Porcentaje coincidencia skills obligatorias": percent,
             "Puntaje skills obligatorias": skill_score,
             "Comentario skills obligatorias": skill_note,
             "Skills obligatorias coincidentes": ratio,
             "Skills con match": matched,
             "Skills faltantes": missing,
-            **({key: value for key, value in base.current_staffing_fields(person).items()
+            **({key: value for key, value in base.current_staffing_fields(person, project).items()
                 if key != "Asignaciones Staffing Q4 (detalle)"} if person else {
+                    "Comentario asignación Staffing": "",
                     "SDATOOL - Proyecto Staffing actual": "",
                     "Fecha Inicio Staffing actual": "",
                     "Fecha Fin Actual Staffing": "",

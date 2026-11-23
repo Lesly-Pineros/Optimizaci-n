@@ -34,6 +34,19 @@ DEMAND_ROLE_MAP = {
     "quality context": "QA",
 }
 
+# En GRM, las etiquetas de desarrollo se conservan como familias distintas.
+# Dev Int requiere una persona interna; Dev Ext prefiere externa y admite interna
+# como respaldo. En matrices sin dominio GRM se mantiene la familia DEV histórica.
+GRM_DEMAND_ROLE_MAP = {
+    **DEMAND_ROLE_MAP,
+    "dev int": "DEV_INT",
+    "dev interno": "DEV_INT",
+    "desarrollador interno": "DEV_INT",
+    "dev ext": "DEV_EXT",
+    "dev externo": "DEV_EXT",
+    "desarrollador externo": "DEV_EXT",
+}
+
 LEADERSHIP_ROLE_MARKERS = (
     "service reliability lead", "tech manager", "lider", "lead",
 )
@@ -51,8 +64,10 @@ INVALID_PERSON_ROLE_MARKERS = (
 )
 
 
-def demand_role_family(value):
-    return DEMAND_ROLE_MAP.get(normalize_role(value))
+def demand_role_family(value, domain=None):
+    """Familia de demanda; GRM distingue desarrollo interno y externo."""
+    role_map = GRM_DEMAND_ROLE_MAP if normalize_role(domain) == "grm" else DEMAND_ROLE_MAP
+    return role_map.get(normalize_role(value))
 
 
 def person_role_families(value, seniority=None):

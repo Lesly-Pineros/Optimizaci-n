@@ -18,9 +18,9 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "DATA"
 RESULTS = ROOT / "RESULTADOS_LIMPIEZA"
 SKILLS_FILE = DATA / "Matriz SkillsCOE.csv"
-INITIATIVES_FILE = DATA / "ENG-Matriz Iniciativas.csv"
+INITIATIVES_FILE = DATA / "GRM-iniciativas.csv"
 PEOPLE_OUTPUT = RESULTS / "Matriz SkillsCOE enriquecida.csv"
-INITIATIVES_OUTPUT = RESULTS / "ENG-Matriz Iniciativas con skills.csv"
+INITIATIVES_OUTPUT = RESULTS / "GRM-iniciativas con skills.csv"
 UNMATCHED_OUTPUT = RESULTS / "Codigos sin cruce SkillsCOE-Staffing.xlsx"
 PEOPLE_REVIEW_OUTPUT = RESULTS / "Personas que requieren tratamiento.xlsx"
 
@@ -28,16 +28,6 @@ SKILLS_HEADER_ROW = 2
 INITIATIVES_HEADER_ROW = 2
 PLANNING_QUARTER = "1Q 2027"
 PLANNING_QUARTER_INDEX = 2027 * 4 + 1
-# La matriz fuente corresponde a iniciativas ENG; la Dirección es una dimensión
-# organizacional distinta y no cambia el dominio requerido por estas plazas.
-DOMAIN_BY_DIRECTION = {
-    "fcp": "ENG",
-    "systems": "ENG",
-    "operaciones": "ENG",
-    "ai tech": "ENG",
-    "infraestructura": "ENG",
-}
-
 FILL_DOWN_FIELDS = (
     "Mesa",
     "Foco estratégico (Fábrica)",
@@ -276,9 +266,15 @@ def prepare_initiatives():
     selected = []
     validation_errors = []
     excluded = defaultdict(int)
+    qa_without_skills = 0
     unmapped_roles = set()
     mesa_focus_groups_source = set()
     source_rows = 0
+    mandatory_skill_fields = [name for name in header if normalize(name).startswith(
+        ("habilidades tecnicas obligatorias", "habilidades funcionales obligatorias"))]
+    all_skill_fields = [name for name in header if normalize(name).startswith((
+        "habilidades tecnicas obligatorias", "habilidades funcionales obligatorias",
+        "habilidades sugerida"))]
     for source_index, source in enumerate(all_rows, start=INITIATIVES_HEADER_ROW + 1):
         excel_row = source_index
         row = dict(source)
@@ -294,6 +290,10 @@ def prepare_initiatives():
             elif filled[field]:
                 row[actual] = filled[field]
 
+        source_domain_column = indexes.get(normalize("Dominio"))
+        source_domain = (row.get(source_domain_column) or "").strip() if source_domain_column else ""
+        domain = "GRM"
+
         mesa_value = normalize(row.get(indexes[normalize("Mesa")], ""))
         focus_value = normalize(row.get(indexes[normalize("Foco estratégico (Fábrica)")], ""))
         if re.fullmatch(r"mesa\s+\d+", mesa_value) and focus_value:
@@ -303,11 +303,10 @@ def prepare_initiatives():
         seniority = normalize(row.get(indexes[normalize("Seniority")], ""))
         seniority = re.sub(r"[-–—]+", " ", seniority)
         seniority = re.sub(r"\s+", " ", seniority).strip()
-        skill_fields = [name for name in header if normalize(name).startswith(
-            ("habilidades tecnicas obligatorias", "habilidades funcionales obligatorias"))]
-        skill_count = len({normalize(row.get(name, "")) for name in skill_fields
+        skill_count = len({normalize(row.get(name, "")) for name in mandatory_skill_fields
                            if (row.get(name) or "").strip()})
-        family = demand_role_family(role)
+        no_skills_diligenced = not any((row.get(name) or "").strip() for name in all_skill_fields)
+        family = demand_role_family(role, domain)
         if family is None:
             excluded["rol sin mapeo"] += 1
             if role.strip():
@@ -316,32 +315,33 @@ def prepare_initiatives():
         if seniority not in VALID_SENIORITY:
             excluded["seniority vacío o no homologado"] += 1
             continue
-        if skill_count < 1:
+        if skill_count < 1 and not (family == "QA" and no_skills_diligenced):
             excluded["sin skills obligatorias solicitadas"] += 1
             continue
+        if family == "QA" and no_skills_diligenced:
+            qa_without_skills += 1
 
         for field in REQUIRED_FILLED_FIELDS:
             if not (row.get(indexes[normalize(field)]) or "").strip():
                 validation_errors.append(f"fila Excel {excel_row}: falta {field}")
-        direction = row.get(indexes[normalize("Dirección")], "")
-        mapped_domain = DOMAIN_BY_DIRECTION.get(normalize(direction))
-        if not mapped_domain:
-            validation_errors.append(
-                f"fila Excel {excel_row}: no hay regla de dominio para Dirección '{direction}'"
-            )
-            continue
-        row["Dominio"] = mapped_domain
+        row["Dominio fuente"] = source_domain
+        if source_domain_column:
+            row[source_domain_column] = domain
+        else:
+            row["Dominio"] = domain
         row["Fila origen"] = str(excel_row)
         selected.append(row)
 
     if validation_errors:
         raise ValueError("Hay filas sin contexto requerido:\n" + "\n".join(validation_errors))
     if not selected:
-        raise ValueError("No hay iniciativas que cumplan rol, seniority y skills obligatorias.")
+        raise ValueError("No hay iniciativas que cumplan rol, seniority y las reglas de skills.")
 
     output_header = list(header)
     if normalize("Dominio") not in indexes:
         output_header.append("Dominio")
+    if normalize("Dominio fuente") not in indexes:
+        output_header.append("Dominio fuente")
     output_header.append("Fila origen")
 
     with INITIATIVES_OUTPUT.open("w", encoding="utf-8-sig", newline="") as file:
@@ -349,8 +349,9 @@ def prepare_initiatives():
         writer.writeheader()
         writer.writerows(selected)
 
-    print(f"Iniciativas revisadas: {source_rows}; conservadas: {len(selected)}; "
+    print(f"Filas revisadas: {source_rows}; demandas conservadas: {len(selected)}; "
           f"exclusiones: {dict(excluded)}.")
+    print(f"Plazas QA conservadas sin skills cargadas: {qa_without_skills}.")
     eligible_groups = {
         (normalize(row.get(indexes[normalize("Mesa")], "")),
          normalize(row.get(indexes[normalize("Foco estratégico (Fábrica)")], "")))
