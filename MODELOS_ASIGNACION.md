@@ -7,8 +7,17 @@ python3 limpieza.py
 python3 asignacion_milp.py
 ```
 
-La limpieza toma SkillsCOE como población, la enriquece con Staffing Q4 y
-clasifica como `BACKLOG` a quien no aparezca en Staffing. ENG se lee desde
+Los reportes auxiliares de códigos sin cruce y skills de iniciativas sin mapeo
+se generan solo cuando se soliciten:
+
+```bash
+python3 reportes_limpieza.py
+```
+
+La limpieza toma Staffing Q4 como población y le agrega rol, seniority y skills
+de SkillsCOE mediante el código de persona. Solo los códigos presentes en ambas
+fuentes entran al pool; el Excel de diferencias se genera con el script auxiliar.
+ENG se lee desde
 `DATA/ENG-iniciativas.csv`; los demás dominios se leen de hojas con nombre
 `<DOMINIO> X Mesa(s)` en `DATA/Iniciativas.xlsx`. Cada salida de iniciativas
 incluye la columna `Dominio`. Se mantienen las filas de vacantes y `SDATOOL` se
@@ -28,8 +37,7 @@ no mapeados se registran en `RESULTADOS_LIMPIEZA/Roles sin mapeo.xlsx`.
   incluir otro dominio, agrégalo a `ASSIGNMENT_DOMAINS` en
   `asignacion_milp.py`.
 - Se excluyen del pool personas sin rol válido, sin Dominio o sin tipo interno/
-  externo válido. Los perfiles `BACKLOG` solo pueden participar si las fuentes
-  sí proporcionan Dominio y tipo de recurso.
+  externo válido.
 - Cada plaza es 1 FTE indivisible. Se consideran hasta dos proyectos/Mesas
   simultáneos por persona, contando asignaciones de Staffing que se traslapan
   con el horizonte.
